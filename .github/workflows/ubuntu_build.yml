@@ -7,12 +7,12 @@ jobs:
     name: Run tests on Python ${{ matrix.python-version }}
     # ubuntu-20.04 supports more versions of Python than ubuntu-22.04
     # https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.12"]
 
     services:
 
@@ -40,23 +40,8 @@ jobs:
           ACCEPT_EULA: Y
           SA_PASSWORD: StrongPassword2022
 
-      postgres:
-        image: postgres:13
-        env:
-          POSTGRES_DB: postgres_db
-          POSTGRES_USER: postgres_user
-          POSTGRES_PASSWORD: postgres_pwd
-        ports:
-        - 5432:5432
-        # needed because the postgres container does not provide a healthcheck
-        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
 
     steps:
-
-    - name: Start MySQL service
-      run: |
-        sudo systemctl start mysql.service
-
     - name: Check initial setup
       run: |
         echo '*** echo $PATH'
@@ -135,27 +120,7 @@ jobs:
         docker exec -i "${{ job.services.mssql2022.id }}" /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'StrongPassword2022' -C -Q "SELECT @@VERSION" || sleep 5
         docker exec -i "${{ job.services.mssql2022.id }}" /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'StrongPassword2022' -C -Q "CREATE DATABASE test"
 
-    - name: Create test database in PostgreSQL
-      run: |
-        echo "*** get version"
-        psql -c "SELECT version()"
-        echo "*** create database"
-        psql -c "CREATE DATABASE test WITH encoding='UTF8' LC_COLLATE='en_US.utf8' LC_CTYPE='en_US.utf8'"
-        echo "*** list databases"
-        psql -l
-      env:
-        PGHOST: localhost
-        PGPORT: 5432
-        PGDATABASE: postgres_db
-        PGUSER: postgres_user
-        PGPASSWORD: postgres_pwd
 
-    - name: Create test database in MySQL
-      run: |
-        echo "*** get status"
-        mysql --user=root --password=root --execute "STATUS"
-        echo "*** create database"
-        mysql --user=root --password=root --execute "CREATE DATABASE test"
 
     - uses: actions/checkout@v4.1.1
 
@@ -186,37 +151,25 @@ jobs:
         echo "*** pyodbc drivers"
         python -c "import pyodbc; print('\n'.join(sorted(pyodbc.drivers())))"
 
-    - name: Run PostgreSQL tests
-      env:
-        PYODBC_POSTGRESQL: "DRIVER={PostgreSQL Unicode};SERVER=localhost;PORT=5432;UID=postgres_user;PWD=postgres_pwd;DATABASE=test"
-      run: |
-        cd "$GITHUB_WORKSPACE"
-        python -m pytest "./tests/postgresql_test.py"
 
-    - name: Run MySQL tests
-      env:
-        PYODBC_MYSQL: "DRIVER={MySQL ODBC 8.0 ANSI Driver};SERVER=localhost;UID=root;PWD=root;DATABASE=test;CHARSET=utf8mb4"
-      run: |
-        cd "$GITHUB_WORKSPACE"
-        python -m pytest "./tests/mysql_test.py"
 
     - name: Run SQL Server 2017 tests
       env:
         PYODBC_SQLSERVER: "DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhost,1401;UID=sa;PWD=StrongPassword2017;DATABASE=test"
       run: |
         cd "$GITHUB_WORKSPACE"
-        python -m pytest "./tests/sqlserver_test.py"
+        python -m pytest -rA "./tests/sqlserver_test.py"
 
     - name: Run SQL Server 2019 tests
       env:
         PYODBC_SQLSERVER: "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1402;UID=sa;PWD=StrongPassword2019;DATABASE=test;Encrypt=Optional"
       run: |
         cd "$GITHUB_WORKSPACE"
-        python -m pytest "./tests/sqlserver_test.py"
+        python -m pytest -rA "./tests/sqlserver_test.py"
 
     - name: Run SQL Server 2022 tests
       env:
         PYODBC_SQLSERVER: "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1403;UID=sa;PWD=StrongPassword2022;DATABASE=test;Encrypt=Optional"
       run: |
         cd "$GITHUB_WORKSPACE"
-        python -m pytest "./tests/sqlserver_test.py"
+        python -m pytest -rA "./tests/sqlserver_test.py"

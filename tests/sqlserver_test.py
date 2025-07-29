@@ -5,6 +5,7 @@ from decimal import Decimal
 from datetime import date, time, datetime
 from functools import lru_cache
 from typing import Iterator
+from time import time as gettime
 
 import pyodbc, pytest
 
@@ -1463,6 +1464,62 @@ def test_emoticons_as_literal(cursor: pyodbc.Cursor):
     result = cursor.execute("select s from t1").fetchone()[0]
 
     assert result == v
+
+
+
+def test_performance(cursor: pyodbc.Cursor):
+    # benchmark_column_bind_vs_fastexecmany.py
+    # Setup: drop/create test table
+    cursor.execute("DROP TABLE IF EXISTS test_perf")
+    cursor.execute("""
+                   CREATE TABLE test_perf
+                   (
+                       id          INT,
+                       value       FLOAT,
+                       description VARCHAR(100),
+                       created_at  DATETIME
+                   )
+                   """)
+
+    # Generate data
+    rowcount = 100000
+    data = [
+        (i, float(i) * 1.1, f"row {i}", datetime(2020, 1, (i % 28) + 1, 12, 0, 0))
+        for i in range(rowcount)
+    ]
+
+    # Method 1: fast_executemany=False
+    cursor.fast_executemany = False
+    start = gettime()
+    cursor.executemany("INSERT INTO test_perf VALUES (?, ?, ?, ?)", data)
+    end = gettime()
+    print(f"executemany: {end - start:.3f} seconds")
+
+    # Method 2: fast_executemany
+    cursor.fast_executemany = True
+    start = gettime()
+    cursor.executemany("INSERT INTO test_perf VALUES (?, ?, ?, ?)", data)
+    end = gettime()
+    print(f"fast_executemany: {end - start:.3f} seconds")
+
+    # try data None, first row - supposed to make it slow
+    data[0] = (None, None, None, None)
+    cursor.fast_executemany = True
+    start = gettime()
+    cursor.executemany("INSERT INTO test_perf VALUES (?, ?, ?, ?)", data)
+    end = gettime()
+    print(f"fast_executemany None first row: {end - start:.3f} seconds")
+
+    # # Method 3: column_bind_insert
+    # # Assuming your pyodbc build exposes column_bind_insert on Cursor
+    # start = gettime()
+    # cursor.column_bind_insert("INSERT INTO test_perf VALUES (?, ?, ?, ?)", data)
+    # end = gettime()
+    # print(f"column_bind_insert: {end - start:.3f} seconds")
+
+    # Verify inserted rows count
+    cursor.execute("SELECT COUNT(*) FROM test_perf")
+    print("Total rows inserted:", cursor.fetchone()[0])
 
 
 def _test_tvp(cursor: pyodbc.Cursor, diff_schema):

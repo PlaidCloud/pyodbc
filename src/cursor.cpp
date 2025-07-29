@@ -24,6 +24,7 @@
 #include "getdata.h"
 #include "dbspecific.h"
 #include <datetime.h>
+#include <string>
 
 enum
 {
@@ -2382,6 +2383,298 @@ static PyObject* Cursor_exit(PyObject* self, PyObject* args)
     Py_RETURN_NONE;
 }
 
+static char column_bind_insert_doc[] =
+"column_bind_insert(sql, rows)\n"
+"\n"
+"Insert multiple rows efficiently using column-wise parameter binding.\n"
+"\n"
+"Arguments:\n"
+"  sql  -- The SQL INSERT statement with parameter placeholders (e.g. ?, ?, ...).\n"
+"  rows -- A list of tuples, each tuple representing a row of data.\n"
+"\n"
+"This method transposes row-wise data into column-wise buffers and binds parameters\n"
+"by column, reducing overhead and improving bulk insert performance.\n"
+"\n"
+"Supported data types:\n"
+"  int, float, str (UTF-8), datetime.date, datetime.datetime, None (as NULL).\n"
+"\n"
+"Returns None on success or raises an exception on error.\n";
+static PyObject* Cursor_column_bind_insert(PyObject* self, PyObject* args) {
+    Cursor* cursor = (Cursor*)self;
+    PyObject* sql;
+    PyObject* pyRows;
+
+    if (!PyArg_ParseTuple(args, "OO!", &sql, &PyList_Type, &pyRows))
+        return nullptr;
+    if (!PyUnicode_Check(sql))
+        return PyErr_Format(PyExc_TypeError, "SQL must be a string");
+
+    size_t rowCount = PyList_Size(pyRows);
+    if (rowCount == 0)
+        Py_RETURN_NONE;
+
+    PyObject* firstRow = PyList_GetItem(pyRows, 0);
+    if (!PyTuple_Check(firstRow))
+        return PyErr_Format(PyExc_TypeError, "Expected list of tuples");
+
+    size_t colCount = PyTuple_Size(firstRow);
+    std::vector<std::vector<void*>> buffers(colCount);
+    std::vector<std::vector<SQLLEN>> indicators(colCount);
+    std::vector<SQLSMALLINT> c_types(colCount);
+
+    for (size_t col = 0; col < colCount; ++col) {
+        PyObject* sample = PyTuple_GetItem(firstRow, col);
+        if (PyLong_Check(sample)) c_types[col] = SQL_C_SLONG;
+        else if (PyFloat_Check(sample)) c_types[col] = SQL_C_DOUBLE;
+        else if (PyUnicode_Check(sample)) c_types[col] = SQL_C_CHAR;
+        else if (PyDateTime_Check(sample)) c_types[col] = SQL_C_TYPE_TIMESTAMP;
+        else if (PyDate_Check(sample)) c_types[col] = SQL_C_TYPE_DATE;
+        else if (sample == Py_None) c_types[col] = SQL_C_CHAR;  // Assume char placeholder
+        else return PyErr_Format(PyExc_TypeError, "Unsupported type in column %zu", col);
+
+        buffers[col].resize(rowCount);
+        indicators[col].resize(rowCount);
+    }
+
+    // Allocate C++ structures
+    std::vector<std::vector<SQL_TIMESTAMP_STRUCT>> ts_storage(colCount);
+    std::vector<std::vector<SQL_DATE_STRUCT>> date_storage(colCount);
+    std::vector<std::vector<int32_t>> int_storage(colCount);
+    std::vector<std::vector<double>> float_storage(colCount);
+    std::vector<std::string> str_storage;
+
+    for (size_t row = 0; row < rowCount; ++row) {
+        PyObject* rowObj = PyList_GetItem(pyRows, row);
+        if (!PyTuple_Check(rowObj)) return PyErr_Format(PyExc_TypeError, "Each row must be a tuple");
+
+        for (size_t col = 0; col < colCount; ++col) {
+            PyObject* val = PyTuple_GetItem(rowObj, col);
+            SQLLEN& ind = indicators[col][row];
+
+            if (val == Py_None) {
+                buffers[col][row] = nullptr;
+                ind = SQL_NULL_DATA;
+            } else {
+                switch (c_types[col]) {
+                    case SQL_C_SLONG:
+                        if (!PyLong_Check(val)) return PyErr_Format(PyExc_TypeError, "Expected int");
+                        int_storage[col].resize(rowCount);
+                        int_storage[col][row] = (int32_t)PyLong_AsLong(val);
+                        buffers[col][row] = &int_storage[col][row];
+                        ind = sizeof(int32_t);
+                        break;
+                    case SQL_C_DOUBLE:
+                        if (!PyFloat_Check(val)) return PyErr_Format(PyExc_TypeError, "Expected float");
+                        float_storage[col].resize(rowCount);
+                        float_storage[col][row] = PyFloat_AsDouble(val);
+                        buffers[col][row] = &float_storage[col][row];
+                        ind = sizeof(double);
+                        break;
+                    case SQL_C_CHAR: {
+                        PyObject* bytes = PyUnicode_AsEncodedString(val, "utf-8", "strict");
+                        if (!bytes) return nullptr;
+                        const char* b = PyBytes_AsString(bytes);
+                        str_storage.emplace_back(b);
+                        buffers[col][row] = (void*)str_storage.back().c_str();
+                        ind = (SQLLEN)str_storage.back().size();
+                        Py_DECREF(bytes);
+                        break;
+                    }
+                    case SQL_C_TYPE_TIMESTAMP:
+                        ts_storage[col].resize(rowCount);
+                        ts_storage[col][row].year = PyDateTime_GET_YEAR(val);
+                        ts_storage[col][row].month = PyDateTime_GET_MONTH(val);
+                        ts_storage[col][row].day = PyDateTime_GET_DAY(val);
+                        ts_storage[col][row].hour = PyDateTime_DATE_GET_HOUR(val);
+                        ts_storage[col][row].minute = PyDateTime_DATE_GET_MINUTE(val);
+                        ts_storage[col][row].second = PyDateTime_DATE_GET_SECOND(val);
+                        ts_storage[col][row].fraction = PyDateTime_DATE_GET_MICROSECOND(val) * 1000;
+                        buffers[col][row] = &ts_storage[col][row];
+                        ind = sizeof(SQL_TIMESTAMP_STRUCT);
+                        break;
+                    case SQL_C_TYPE_DATE:
+                        date_storage[col].resize(rowCount);
+                        date_storage[col][row].year = PyDateTime_GET_YEAR(val);
+                        date_storage[col][row].month = PyDateTime_GET_MONTH(val);
+                        date_storage[col][row].day = PyDateTime_GET_DAY(val);
+                        buffers[col][row] = &date_storage[col][row];
+                        ind = sizeof(SQL_DATE_STRUCT);
+                        break;
+                    default:
+                        return PyErr_Format(PyExc_TypeError, "Unhandled C type");
+                }
+            }
+        }
+    }
+
+    SQLSetStmtAttr(cursor->hstmt, SQL_ATTR_PARAM_BIND_TYPE, SQL_PARAM_BIND_BY_COLUMN, 0);
+    SQLSetStmtAttr(cursor->hstmt, SQL_ATTR_PARAMSET_SIZE, (SQLPOINTER)rowCount, 0);
+
+    for (size_t col = 0; col < colCount; ++col) {
+        SQLBindParameter(cursor->hstmt, (SQLUSMALLINT)(col + 1), SQL_PARAM_INPUT,
+                         c_types[col], SQL_UNKNOWN_TYPE, 0, 0,
+                         (SQLPOINTER)buffers[col].data(), 0, indicators[col].data());
+    }
+
+    PyObject* encoded_sql = PyUnicode_AsEncodedString(sql, "utf-8", "strict");
+    if (!encoded_sql) return nullptr;
+    const char* sql_text = PyBytes_AsString(encoded_sql);
+    RETCODE ret = SQLPrepare(cursor->hstmt, (SQLCHAR*)sql_text, SQL_NTS);
+    Py_DECREF(encoded_sql);
+    if (!SQL_SUCCEEDED(ret))
+        return RaiseErrorFromHandle(cur->cnxn, "SQLPrepare", cursor->hstmt, SQL_HANDLE_STMT);
+
+    ret = SQLExecute(cursor->hstmt);
+    if (!SQL_SUCCEEDED(ret))
+        return RaiseErrorFromHandle(cur->cnxn, "SQLExecute", cursor->hstmt, SQL_HANDLE_STMT);
+
+    Py_RETURN_NONE;
+}
+
+static char bcp_init_doc[] = "bcp_init(table, database=None)\n\nInitializes the bulk copy operation for the specified table.";
+static PyObject* Cursor_bcp_init(PyObject* self, PyObject* args, PyObject* kwargs) {
+    Cursor* cursor = (Cursor*)self;
+    Connection* conn = cursor->cnxn;
+    const char* table = nullptr;
+    const char* database = nullptr;
+    static const char* kwlist[] = {"table", "database", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|s", (char**)kwlist, &table, &database))
+        return nullptr;
+
+    RETCODE ret = bcp_init(conn->hdbc, (LPCSTR)table, nullptr, nullptr, DB_IN);
+    if (!SQL_SUCCEEDED(ret))
+        return RaiseErrorFromHandle(cursor->cnxn, "bcp_init", conn->hdbc, SQL_HANDLE_DBC);
+
+    Py_RETURN_NONE;
+}
+
+static char bcp_bind_doc[] = "bcp_bind(value, column, c_type=SQL_C_CHAR, data_len=0)\n\nBinds a value to a BCP column. Supports strings, integers, floats, dates, datetimes, and unicode.";
+static PyObject* Cursor_bcp_bind(PyObject* self, PyObject* args, PyObject* kwargs) {
+    Cursor* cursor = (Cursor*)self;
+    Connection* conn = cursor->cnxn;
+    PyObject* value;
+    int col_index;
+    int c_type = SQL_C_CHAR;
+    int data_len = 0;
+
+    static const char* kwlist[] = {"value", "column", "c_type", "data_len", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oi|ii", (char**)kwlist, &value, &col_index, &c_type, &data_len))
+        return nullptr;
+
+    void* buffer = nullptr;
+    DBINT cbData = 0;
+
+    if (value == Py_None) {
+        buffer = nullptr;
+        cbData = SQL_NULL_DATA;  // Indicates NULL to BCP API
+    } else if (PyUnicode_Check(value)) {
+        if (c_type == SQL_C_WCHAR) {
+            Py_ssize_t size = PyUnicode_GET_LENGTH(value);
+            wchar_t* wdata = (wchar_t*)malloc((size + 1) * sizeof(wchar_t));
+            if (!wdata) return PyErr_NoMemory();
+            Py_ssize_t copied = PyUnicode_AsWideChar(value, wdata, size);
+            if (copied < 0) {
+                free(wdata);
+                return nullptr;
+            }
+            wdata[copied] = 0;
+            buffer = wdata;
+            cbData = (DBINT)(copied * sizeof(wchar_t));
+        } else {
+            PyObject* bytes = PyUnicode_AsEncodedString(value, "utf-8", "strict");
+            if (!bytes) return nullptr;
+            buffer = malloc(PyBytes_GET_SIZE(bytes));
+            memcpy(buffer, PyBytes_AS_STRING(bytes), PyBytes_GET_SIZE(bytes));
+            cbData = (DBINT)PyBytes_GET_SIZE(bytes);
+            Py_DECREF(bytes);
+        }
+    } else if (PyBytes_Check(value)) {
+        buffer = malloc(PyBytes_GET_SIZE(value));
+        memcpy(buffer, PyBytes_AS_STRING(value), PyBytes_GET_SIZE(value));
+        cbData = (DBINT)PyBytes_GET_SIZE(value);
+    } else if (PyLong_Check(value)) {
+        buffer = malloc(sizeof(DBINT));
+        *(DBINT*)buffer = (DBINT)PyLong_AsLong(value);
+        cbData = sizeof(DBINT);
+    } else if (PyFloat_Check(value)) {
+        buffer = malloc(sizeof(double));
+        *(double*)buffer = PyFloat_AsDouble(value);
+        cbData = sizeof(double);
+    } else if (PyDateTime_Check(value)) {
+        SQL_TIMESTAMP_STRUCT* ts = (SQL_TIMESTAMP_STRUCT*)malloc(sizeof(SQL_TIMESTAMP_STRUCT));
+        ts->year = PyDateTime_GET_YEAR(value);
+        ts->month = PyDateTime_GET_MONTH(value);
+        ts->day = PyDateTime_GET_DAY(value);
+        ts->hour = PyDateTime_DATE_GET_HOUR(value);
+        ts->minute = PyDateTime_DATE_GET_MINUTE(value);
+        ts->second = PyDateTime_DATE_GET_SECOND(value);
+        ts->fraction = PyDateTime_DATE_GET_MICROSECOND(value) * 1000;
+        buffer = ts;
+        cbData = sizeof(SQL_TIMESTAMP_STRUCT);
+    } else if (PyDate_Check(value)) {
+        SQL_DATE_STRUCT* ds = (SQL_DATE_STRUCT*)malloc(sizeof(SQL_DATE_STRUCT));
+        ds->year = PyDateTime_GET_YEAR(value);
+        ds->month = PyDateTime_GET_MONTH(value);
+        ds->day = PyDateTime_GET_DAY(value);
+        buffer = ds;
+        cbData = sizeof(SQL_DATE_STRUCT);
+    } else if (PyTime_Check(value)) {
+        SQL_TIME_STRUCT* t = (SQL_TIME_STRUCT*)malloc(sizeof(SQL_TIME_STRUCT));
+        t->hour = PyDateTime_TIME_GET_HOUR(value);
+        t->minute = PyDateTime_TIME_GET_MINUTE(value);
+        t->second = PyDateTime_TIME_GET_SECOND(value);
+        buffer = t;
+        cbData = sizeof(SQL_TIME_STRUCT);
+    } else {
+        PyErr_SetString(PyExc_TypeError, "Unsupported type for bcp_bind");
+        return nullptr;
+    }
+
+    // Track buffer to free later if not NULL
+    if (buffer != nullptr)
+        cursor->bcp_bound_buffers.push_back(buffer);
+
+    RETCODE ret = bcp_bind(conn->hdbc, (BYTE*)buffer, 0, cbData, nullptr, 0, c_type, col_index);
+    if (!SQL_SUCCEEDED(ret))
+        return RaiseErrorFromHandle(conn, "bcp_bind", conn->hdbc, SQL_HANDLE_DBC);
+
+    Py_RETURN_NONE;
+}
+
+static char bcp_sendrow_doc[] = "bcp_sendrow()\n\nSends a single row of bound data to the server.";
+static PyObject* Cursor_bcp_sendrow(PyObject* self, PyObject* args) {
+    Cursor* cursor = (Cursor*)self;
+    Connection* conn = cursor->connection;
+    RETCODE ret = bcp_sendrow(conn->hdbc);
+    if (!SQL_SUCCEEDED(ret))
+        return RaiseErrorFromHandle(conn, "bcp_sendrow", conn->hdbc, SQL_HANDLE_DBC);
+    Py_RETURN_NONE;
+}
+
+static char bcp_batch_doc[] = "bcp_batch()\n\nSends all pending rows in the current batch to the server.";
+static PyObject* Cursor_bcp_batch(PyObject* self, PyObject* args) {
+    Cursor* cursor = (Cursor*)self;
+    Connection* conn = cursor->connection;
+    DBINT result = bcp_batch(conn->hdbc);
+    if (result == -1)
+        return RaiseErrorFromHandle(conn, "bcp_batch", conn->hdbc, SQL_HANDLE_DBC);
+    return PyLong_FromLong(result);
+}
+
+static char bcp_done_doc[] = "bcp_done()\n\nFinalizes the bulk copy operation and frees internal buffers.";
+static PyObject* Cursor_bcp_done(PyObject* self, PyObject* args) {
+    Cursor* cursor = (Cursor*)self;
+    Connection* conn = cursor->connection;
+    DBINT result = bcp_done(conn->hdbc);
+    for (auto ptr : cursor->bcp_bound_buffers)
+        free(ptr);
+    cursor->bcp_bound_buffers.clear();
+    if (result == -1)
+        return RaiseErrorFromHandle(conn, "bcp_done", conn->hdbc, SQL_HANDLE_DBC);
+    return PyLong_FromLong(result);
+}
+
+
 
 static PyMethodDef Cursor_methods[] =
 {
@@ -2411,6 +2704,12 @@ static PyMethodDef Cursor_methods[] =
     {"cancel",           (PyCFunction)Cursor_cancel,           METH_NOARGS,                cancel_doc},
     {"__enter__",        Cursor_enter,                         METH_NOARGS,                enter_doc            },
     {"__exit__",         Cursor_exit,                          METH_VARARGS,               exit_doc             },
+    {"column_bind_insert", (PyCFunction)Cursor_column_bind_insert, METH_VARARGS,             column_bind_insert_doc},
+    {"bcp_init",          (PyCFunction)Cursor_bcp_init,        METH_VARARGS | METH_KEYWORDS, bcp_init_doc        },
+    {"bcp_bind",          (PyCFunction)Cursor_bcp_bind,        METH_VARARGS | METH_KEYWORDS, bcp_bind_doc        },
+    {"bcp_sendrow",       (PyCFunction)Cursor_bcp_sendrow,     METH_NOARGS,                  bcp_sendrow_doc     },
+    {"bcp_batch",         (PyCFunction)Cursor_bcp_batch,       METH_NOARGS,                  bcp_batch_doc       },
+    {"bcp_done",          (PyCFunction)Cursor_bcp_done,        METH_NOARGS,                  bcp_done_doc        },
     {0, 0, 0, 0}
 };
 

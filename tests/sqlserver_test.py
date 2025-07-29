@@ -1465,6 +1465,157 @@ def test_emoticons_as_literal(cursor: pyodbc.Cursor):
     assert result == v
 
 
+def test_bcp_load_single_row(cursor: pyodbc.Cursor):
+    test_table = "bcp_test_single"
+    cursor.execute(f"""
+        CREATE TABLE {test_table} (
+            id INT,
+            val VARCHAR(100),
+            dt DATETIME
+        )
+    """)
+    cursor.bcp_init(test_table)
+    cursor.bcp_bind(1, 1)
+    cursor.bcp_bind('test value', 2)
+    cursor.bcp_bind(datetime.datetime(2025, 7, 28, 12, 34, 56), 3)
+    cursor.bcp_sendrow()
+    cursor.bcp_done()
+
+    cursor.execute(f"SELECT id, val, dt FROM {test_table}")
+    row = cursor.fetchone()
+    assert row[0] == 1
+    assert row[1] == 'test value'
+    assert row[2] == datetime.datetime(2025, 7, 28, 12, 34, 56)
+    cursor.execute(f"DROP TABLE {test_table}")
+
+def test_bcp_load_multiple_rows_and_batch(cursor: pyodbc.Cursor):
+    test_table = "bcp_test_multiple"
+    cursor.execute(f"""
+        CREATE TABLE {test_table} (
+            id INT,
+            val VARCHAR(100),
+            dt DATETIME
+        )
+    """)
+    cursor.bcp_init(test_table)
+
+    for i in range(5):
+        cursor.bcp_bind(i, 1)
+        cursor.bcp_bind(f"row{i}", 2)
+        cursor.bcp_bind(datetime.datetime(2025, 1, i + 1, 0, 0, 0), 3)
+        cursor.bcp_sendrow()
+
+    cursor.bcp_batch()
+    cursor.bcp_done()
+
+    cursor.execute(f"SELECT COUNT(*) FROM {test_table}")
+    count = cursor.fetchone()[0]
+    assert count == 5
+    cursor.execute(f"DROP TABLE {test_table}")
+
+def test_bcp_load_empty_rows(cursor: pyodbc.Cursor):
+    test_table = "bcp_test_empty"
+    cursor.execute(f"CREATE TABLE {test_table} (id INT)")
+    cursor.bcp_init(test_table)
+    # No binds or sendrow called
+    cursor.bcp_done()
+    cursor.execute(f"SELECT COUNT(*) FROM {test_table}")
+    count = cursor.fetchone()[0]
+    assert count == 0
+    cursor.execute(f"DROP TABLE {test_table}")
+
+def test_bcp_bind_null_values(cursor: pyodbc.Cursor):
+    test_table = "bcp_test_nulls"
+    cursor.execute(f"""
+        CREATE TABLE {test_table} (
+            id INT,
+            val VARCHAR(100),
+            dt DATETIME
+        )
+    """)
+    cursor.bcp_init(test_table)
+    cursor.bcp_bind(None, 1)
+    cursor.bcp_bind(None, 2)
+    cursor.bcp_bind(None, 3)
+    cursor.bcp_sendrow()
+    cursor.bcp_done()
+
+    cursor.execute(f"SELECT id, val, dt FROM {test_table}")
+    row = cursor.fetchone()
+    assert row[0] is None
+    assert row[1] is None
+    assert row[2] is None
+    cursor.execute(f"DROP TABLE {test_table}")
+
+def test_bcp_bind_invalid_type(cursor: pyodbc.Cursor):
+    test_table = "bcp_test_invalid"
+    cursor.execute(f"CREATE TABLE {test_table} (id INT)")
+    cursor.bcp_init(test_table)
+
+    try:
+        cursor.bcp_bind(object(), 1)  # Unsupported type
+    except TypeError:
+        pass
+    else:
+        assert False, "Expected TypeError for unsupported type"
+
+    cursor.bcp_done()
+    cursor.execute(f"DROP TABLE {test_table}")
+
+def test_bcp_invalid_column_index(cursor: pyodbc.Cursor):
+    test_table = "bcp_test_invalid_col"
+    cursor.execute(f"CREATE TABLE {test_table} (id INT)")
+    cursor.bcp_init(test_table)
+    try:
+        cursor.bcp_bind(1, 99)  # Invalid column index
+    except Exception as e:
+        assert "column" in str(e).lower() or "index" in str(e).lower()
+    else:
+        assert False, "Expected error for invalid column index"
+    cursor.bcp_done()
+    cursor.execute(f"DROP TABLE {test_table}")
+
+
+def performance_test(cursor: pyodbc.Cursor):
+    # benchmark_column_bind_vs_fastexecmany.py
+    # Setup: drop/create test table
+    cursor.execute("DROP TABLE IF EXISTS test_perf")
+    cursor.execute("""
+                   CREATE TABLE test_perf
+                   (
+                       id          INT,
+                       value       FLOAT,
+                       description VARCHAR(100),
+                       created_at  DATETIME
+                   )
+                   """)
+
+    # Generate data
+    rowcount = 10000
+    data = [
+        (i, float(i) * 1.1, f"row {i}", datetime.datetime(2020, 1, (i % 28) + 1, 12, 0, 0))
+        for i in range(rowcount)
+    ]
+
+    # Method 1: fast_executemany
+    cursor.fast_executemany = True
+    start = time.time()
+    cursor.executemany("INSERT INTO test_perf VALUES (?, ?, ?, ?)", data)
+    end = time.time()
+    print(f"fast_executemany: {end - start:.3f} seconds")
+
+    # Method 2: column_bind_insert
+    # Assuming your pyodbc build exposes column_bind_insert on Cursor
+    start = time.time()
+    cursor.column_bind_insert("INSERT INTO test_perf VALUES (?, ?, ?, ?)", data)
+    end = time.time()
+    print(f"column_bind_insert: {end - start:.3f} seconds")
+
+    # Verify inserted rows count
+    cursor.execute("SELECT COUNT(*) FROM test_perf")
+    print("Total rows inserted:", cursor.fetchone()[0])
+
+
 def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
     # Test table value parameters (TVP).  I like the explanation here:
     #

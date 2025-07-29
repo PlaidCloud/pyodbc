@@ -12,6 +12,8 @@
 
 #ifndef CURSOR_H
 #define CURSOR_H
+#undef max
+#include <vector>
 
 struct Connection;
 
@@ -154,6 +156,9 @@ struct Cursor
     // The messages attribute described in the DB API 2.0 specification.
     // Contains a list of all non-data messages provided by the driver, retrieved using SQLGetDiagRec.
     PyObject* messages;
+
+    // A buffer for use during bcp data loads
+    std::vector<void*> bcp_bound_buffers;
 };
 
 int GetDiagRecs(Cursor* cur);

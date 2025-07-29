@@ -40,4 +40,67 @@ struct PYSQLGUID
     byte Data4[8];
 };
 
+// ---------------------------------------------------------------------------
+// BCP ODBC Extension Definitions
+// Minimal self-contained header replacements for Microsoft's bcp.h
+// Allows pyODBC to call BCP APIs without additional SDK headers.
+// ---------------------------------------------------------------------------
+
+#ifndef DBINT
+typedef long DBINT;        // 32-bit signed integer for BCP sizes/counts
+#endif
+
+// Return codes
+#ifndef BCP_SUCCESS
+#define BCP_SUCCESS        0
+#endif
+#ifndef BCP_ERROR
+#define BCP_ERROR          (-1)
+#endif
+#ifndef BCP_EOF
+#define BCP_EOF            (-2)
+#endif
+
+// Directions for bcp_init
+#ifndef DB_IN
+#define DB_IN              1   // From program to SQL Server
+#endif
+#ifndef DB_OUT
+#define DB_OUT             2   // From SQL Server to program
+#endif
+
+// Options for bcp_control
+#ifndef BCPMAXERRS
+#define BCPMAXERRS         1
+#endif
+#ifndef BCPFIRST
+#define BCPFIRST           2
+#endif
+#ifndef BCPLAST
+#define BCPLAST            3
+#endif
+#ifndef BCPBATCH
+#define BCPBATCH           4
+#endif
+#ifndef BCPKEEPNULLS
+#define BCPKEEPNULLS       5
+#endif
+#ifndef BCPABORT
+#define BCPABORT           6
+#endif
+#ifndef BCPHINTS
+#define BCPHINTS           7
+#endif
+#ifndef BCPKEEPIDENTITY
+#define BCPKEEPIDENTITY    8
+#endif
+
+// Special data length markers for bcp_collen
+#ifndef SQL_NULL_DATA
+#define SQL_NULL_DATA      (-1)
+#endif
+#ifndef SQL_VARLEN_DATA
+#define SQL_VARLEN_DATA    (-10)
+#endif
+
 #endif // DBSPECIFIC_H

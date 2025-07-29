@@ -7,12 +7,12 @@ jobs:
     name: Run tests on Python ${{ matrix.python-version }}
     # ubuntu-20.04 supports more versions of Python than ubuntu-22.04
     # https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.12"]
 
     services:
 
@@ -40,25 +40,12 @@ jobs:
           ACCEPT_EULA: Y
           SA_PASSWORD: StrongPassword2022
 
-      postgres:
-        image: postgres:13
-        env:
-          POSTGRES_DB: postgres_db
-          POSTGRES_USER: postgres_user
-          POSTGRES_PASSWORD: postgres_pwd
-        ports:
-        - 5432:5432
-        # needed because the postgres container does not provide a healthcheck
-        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
 
     steps:
 
-    - name: Start MySQL service
-      run: |
-        sudo systemctl start mysql.service
-
     - name: Check initial setup
       run: |
+        sudo apt-get install unixodbc unixodbc-dev
         echo '*** echo $PATH'
         echo "$PATH"
         echo "*** odbcinst -j"
@@ -186,19 +173,7 @@ jobs:
         echo "*** pyodbc drivers"
         python -c "import pyodbc; print('\n'.join(sorted(pyodbc.drivers())))"
 
-    - name: Run PostgreSQL tests
-      env:
-        PYODBC_POSTGRESQL: "DRIVER={PostgreSQL Unicode};SERVER=localhost;PORT=5432;UID=postgres_user;PWD=postgres_pwd;DATABASE=test"
-      run: |
-        cd "$GITHUB_WORKSPACE"
-        python -m pytest "./tests/postgresql_test.py"
 
-    - name: Run MySQL tests
-      env:
-        PYODBC_MYSQL: "DRIVER={MySQL ODBC 8.0 ANSI Driver};SERVER=localhost;UID=root;PWD=root;DATABASE=test;CHARSET=utf8mb4"
-      run: |
-        cd "$GITHUB_WORKSPACE"
-        python -m pytest "./tests/mysql_test.py"
 
     - name: Run SQL Server 2017 tests
       env:

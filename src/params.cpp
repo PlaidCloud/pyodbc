@@ -1887,6 +1887,111 @@ PyTypeObject NullParamType =
 
 PyObject* null_binary;
 
+
+// New method: Perform BCP load operation
+static PyObject* ExecuteBCP(Cursor* self, PyObject* args)
+{
+    PyObject* query = 0;
+    PyObject* param_list = 0;
+
+    if (!PyArg_ParseTuple(args, "OO", &query, &param_list))
+        return 0;
+
+    if (!PyList_Check(param_list)) {
+        PyErr_SetString(PyExc_TypeError, "Parameters must be a list for BCP");
+        return 0;
+    }
+
+    // Convert query to C string
+    PyObject* query_str = PyObject_Str(query);
+    if (!query_str) return 0;
+    const char* sql = PyUnicode_AsUTF8(query_str);
+    if (!sql) {
+        Py_DECREF(query_str);
+        return 0;
+    }
+
+    // Parse table name
+    char table_name[256] = {0};
+    if (!parse_insert_sql(sql, table_name, sizeof(table_name))) {
+        Py_DECREF(query_str);
+        PyErr_SetString(PyExc_ValueError, "Invalid INSERT statement for BCP");
+        return 0;
+    }
+
+    // Initialize BCP
+    PyObject* init_args = Py_BuildValue("s", table_name);
+    if (!init_args) {
+        Py_DECREF(query_str);
+        return 0;
+    }
+    PyObject* init_result = Connection_bcp_init(self->cnxn, init_args);
+    Py_DECREF(init_args);
+    if (!init_result) {
+        Py_DECREF(query_str);
+        return 0;
+    }
+    Py_DECREF(init_result);
+
+    // Bind columns using first row
+    PyObject* first_row = PyList_GetItem(param_list, 0);
+    if (!first_row || !PyTuple_Check(first_row)) {
+        Py_DECREF(query_str);
+        Connection_bcp_done(self->cnxn);
+        PyErr_SetString(PyExc_ValueError, "Invalid first row");
+        return 0;
+    }
+    PyObject* bind_args = Py_BuildValue("On", first_row, 1000); // Default batch_size=1000
+    PyObject* bind_result = Connection_bcp_bind(self->cnxn, bind_args);
+    Py_DECREF(bind_args);
+    if (!bind_result) {
+        Py_DECREF(query_str);
+        Connection_bcp_done(self->cnxn);
+        return 0;
+    }
+    Py_DECREF(bind_result);
+
+    // Process rows in chunks
+    Py_ssize_t num_rows = PyList_Size(param_list);
+    Py_ssize_t batch_size = self->cnxn->batch_size;
+    for (Py_ssize_t i = 0; i < num_rows; i += batch_size) {
+        Py_ssize_t chunk_size = Py_MIN(batch_size, num_rows - i);
+        PyObject* chunk = PyList_GetSlice(param_list, i, i + chunk_size);
+        if (!chunk) {
+            Py_DECREF(query_str);
+            Connection_bcp_done(self->cnxn);
+            return 0;
+        }
+        PyObject* send_args = Py_BuildValue("(O)", chunk);
+        PyObject* send_result = Connection_bcp_sendrow(self->cnxn, send_args);
+        Py_DECREF(send_args);
+        Py_DECREF(chunk);
+        if (!send_result) {
+            Py_DECREF(query_str);
+            Connection_bcp_done(self->cnxn);
+            return 0;
+        }
+        Py_DECREF(send_result);
+
+        // Commit batch
+        PyObject* batch_result = Connection_bcp_batch(self->cnxn);
+        if (!batch_result) {
+            Py_DECREF(query_str);
+            Connection_bcp_done(self->cnxn);
+            return 0;
+        }
+        Py_DECREF(batch_result);
+    }
+
+    // Finalize BCP
+    PyObject* done_result = Connection_bcp_done(self->cnxn);
+    Py_DECREF(query_str);
+    if (!done_result) return 0;
+    Py_DECREF(done_result);
+
+    Py_RETURN_NONE;
+}
+
 bool Params_init()
 {
     if (PyType_Ready(&NullParamType) < 0)

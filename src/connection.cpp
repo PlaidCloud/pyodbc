@@ -16,6 +16,7 @@
 #include "pyodbcmodule.h"
 #include "errors.h"
 #include "cnxninfo.h"
+#include "dbspecific.h"
 
 
 static char connection_doc[] =
@@ -1326,6 +1327,384 @@ static PyObject* Connection_setdecoding(PyObject* self, PyObject* args, PyObject
 }
 
 
+// ColumnInfo struct for BCP binding
+struct ColumnInfo {
+    SQLSMALLINT sql_type;
+    SQLULEN col_size;
+    SQLLEN term_len;
+    void* buffer;
+    SQLLEN* indicator;
+    PyObject** converted; // Store converted Python objects (batch_size rows)
+    PyTypeObject* py_type; // Expected Python type for validation
+};
+
+// Helper function to clean up columns
+static void cleanup_columns(Connection* self)
+{
+    if (self->columns) {
+        for (Py_ssize_t i = 0; i < self->num_cols; i++) {
+            for (Py_ssize_t r = 0; r < self->batch_size; r++)
+                Py_CLEAR(self->columns[i].converted[r]);
+            free(self->columns[i].buffer);
+            free(self->columns[i].indicator);
+            free(self->columns[i].converted);
+            Py_CLEAR(self->columns[i].py_type);
+        }
+        free(self->columns);
+        self->columns = 0;
+        self->num_cols = 0;
+        self->batch_size = 0;
+    }
+}
+
+// Helper function to load BCP function pointers
+static int load_bcp_functions(Connection* self)
+{
+    HMODULE hmod = GetModuleHandle(NULL); // Assume ODBC driver is already loaded
+    self->bcp_init = (bcp_init_t)GetProcAddress(hmod, "bcp_init");
+    self->bcp_bind = (bcp_bind_t)GetProcAddress(hmod, "bcp_bind");
+    self->bcp_sendrow = (bcp_sendrow_t)GetProcAddress(hmod, "bcp_sendrow");
+    self->bcp_batch = (bcp_batch_t)GetProcAddress(hmod, "bcp_batch");
+    self->bcp_done = (bcp_done_t)GetProcAddress(hmod, "bcp_done");
+
+    return self->bcp_init && self->bcp_bind && self->bcp_sendrow && self->bcp_batch && self->bcp_done;
+}
+
+
+static PyObject* Connection_bcp_init(PyObject* self, PyObject* args, PyObject* kwargs) {
+    Connection* cnxn = Connection_Validate(self);
+    if (!cnxn)
+        return 0;
+
+    const char* table = 0;
+    const char* file = 0;
+    int direction = DB_IN;
+    int hint = 0;
+
+    if (!PyArg_ParseTuple(args, "s|sii", &table, &file, &direction, &hint))
+        return 0;
+
+    cleanup_columns(self);
+
+    int ret = self->bcp_init(cnxn->hdbc,
+                           (SQLWCHAR*)TextBuffer_FromUTF8(table),
+                           file ? (SQLWCHAR*)TextBuffer_FromUTF8(file) : 0,
+                           direction,
+                           hint);
+
+    if (ret != SUCCEED)
+        return RaiseErrorFromHandle(cnxn, "bcp_init", cnxn->hdbc, 0);
+
+    Py_RETURN_NONE;
+}
+
+// Bind columns for BCP
+static PyObject* Connection_bcp_bind(Connection* self, PyObject* args)
+{
+    PyObject* sample_row = 0;
+    Py_ssize_t batch_size = 1000; // Default batch size
+
+    if (!PyArg_ParseTuple(args, "O|n", &sample_row, &batch_size))
+        return 0;
+
+    if (!self->bcp_initialized) {
+        PyErr_SetString(PyExc_ValueError, "BCP not initialized. Call bcp_init first.");
+        return 0;
+    }
+
+    if (!PyTuple_Check(sample_row)) {
+        PyErr_SetString(PyExc_TypeError, "Sample row must be a tuple");
+        return 0;
+    }
+
+    if (batch_size <= 0) {
+        PyErr_SetString(PyExc_ValueError, "Batch size must be positive");
+        return 0;
+    }
+
+    Py_ssize_t num_cols = PyTuple_Size(sample_row);
+    if (num_cols == 0) {
+        PyErr_SetString(PyExc_ValueError, "Empty sample row");
+        return 0;
+    }
+
+    cleanup_columns(self);
+
+    self->columns = (ColumnInfo*)calloc(num_cols, sizeof(ColumnInfo));
+    if (!self->columns) {
+        PyErr_SetString(PyExc_MemoryError, "Failed to allocate column info");
+        return 0;
+    }
+    self->num_cols = num_cols;
+    self->batch_size = batch_size;
+
+    for (Py_ssize_t col = 0; col < num_cols; col++) {
+        PyObject* value = PyTuple_GetItem(sample_row, col);
+        SQLSMALLINT decimal_digits;
+        SQLSMALLINT sql_c_type;
+        self->columns[col].converted = (PyObject**)calloc(batch_size, sizeof(PyObject*));
+        if (!self->columns[col].converted) {
+            cleanup_columns(self);
+            PyErr_SetString(PyExc_MemoryError, "Failed to allocate converted array");
+            return 0;
+        }
+
+        self->columns[col].sql_type = DetectCType(value, &self->columns[col].col_size, &decimal_digits, &sql_c_type, &self->columns[col].converted[0]);
+        if (self->columns[col].sql_type == SQL_UNKNOWN_TYPE) {
+            cleanup_columns(self);
+            PyErr_SetString(PyExc_ValueError, "Unsupported column type");
+            return 0;
+        }
+
+        self->columns[col].py_type = PyObject_Type(value);
+        if (!self->columns[col].py_type) {
+            cleanup_columns(self);
+            return 0;
+        }
+        Py_INCREF(self->columns[col].py_type);
+
+        self->columns[col].term_len = (self->columns[col].sql_type == SQLCHAR) ? SQL_NTS : 0;
+        self->columns[col].indicator = (SQLLEN*)calloc(batch_size, sizeof(SQLLEN));
+        if (!self->columns[col].indicator) {
+            cleanup_columns(self);
+            PyErr_SetString(PyExc_MemoryError, "Failed to allocate indicator array");
+            return 0;
+        }
+
+        switch (self->columns[col].sql_type) {
+            case SQLCHAR:
+                self->columns[col].buffer = calloc(batch_size, self->columns[col].col_size + 1);
+                break;
+            case SQLINT:
+                self->columns[col].buffer = calloc(batch_size, sizeof(SQLINTEGER));
+                break;
+            case SQLFLT8:
+                self->columns[col].buffer = calloc(batch_size, sizeof(SQLDOUBLE));
+                break;
+            case SQLDATETIME:
+                self->columns[col].buffer = calloc(batch_size, sizeof(SQL_TIMESTAMP_STRUCT));
+                break;
+            default:
+                cleanup_columns(self);
+                PyErr_SetString(PyExc_ValueError, "Unsupported SQL type in buffer allocation");
+                return 0;
+        }
+
+        if (!self->columns[col].buffer) {
+            cleanup_columns(self);
+            PyErr_SetString(PyExc_MemoryError, "Failed to allocate column buffer");
+            return 0;
+        }
+
+        RETCODE rc = self->bcp_bind(self->hdbc, self->columns[col].buffer, 0, self->columns[col].term_len,
+                                    self->columns[col].indicator, sizeof(SQLLEN), self->columns[col].sql_type, col + 1);
+        if (!SQL_SUCCEEDED(rc)) {
+            cleanup_columns(self);
+            RaiseErrorFromHandle(self, "bcp_bind", 0, self->hdbc, 0);
+            return 0;
+        }
+    }
+
+    for (Py_ssize_t col = 0; col < num_cols; col++) {
+        Py_CLEAR(self->columns[col].converted[0]);
+    }
+
+    Py_RETURN_NONE;
+}
+
+// Send a single row or chunk of rows for BCP
+static PyObject* Connection_bcp_sendrow(Connection* self, PyObject* args)
+{
+    PyObject* data = 0;
+
+    if (!PyArg_ParseTuple(args, "O", &data))
+        return 0;
+
+    if (!self->bcp_initialized) {
+        PyErr_SetString(PyExc_ValueError, "BCP not initialized. Call bcp_init first.");
+        return 0;
+    }
+
+    if (!self->columns || self->num_cols == 0) {
+        PyErr_SetString(PyExc_ValueError, "Columns not bound. Call bcp_bind first.");
+        return 0;
+    }
+
+    PyObject* rows = NULL;
+    Py_ssize_t num_rows;
+
+    if (PyTuple_Check(data)) {
+        rows = PyList_New(1);
+        if (!rows) return 0;
+        PyList_SET_ITEM(rows, 0, data);
+        Py_INCREF(data);
+        num_rows = 1;
+    } else if (PyList_Check(data)) {
+        rows = data;
+        Py_INCREF(rows);
+        num_rows = PyList_Size(data);
+    } else {
+        PyErr_SetString(PyExc_TypeError, "Data must be a tuple or list");
+        return 0;
+    }
+
+    if (num_rows == 0) {
+        Py_DECREF(rows);
+        PyErr_SetString(PyExc_ValueError, "Empty data");
+        return 0;
+    }
+
+    if (num_rows > self->batch_size) {
+        Py_DECREF(rows);
+        PyErr_Format(PyExc_ValueError, "Number of rows (%zd) exceeds batch size (%zd)", num_rows, self->batch_size);
+        return 0;
+    }
+
+    for (Py_ssize_t row = 0; row < num_rows; row++) {
+        PyObject* row_tuple = PyList_GetItem(rows, row);
+        if (!PyTuple_Check(row_tuple) || PyTuple_Size(row_tuple) != self->num_cols) {
+            for (Py_ssize_t col = 0; col < self->num_cols; col++) {
+                for (Py_ssize_t r = 0; r < row; r++)
+                    Py_CLEAR(self->columns[col].converted[r]);
+            }
+            Py_DECREF(rows);
+            PyErr_SetString(PyExc_ValueError, "Invalid row data");
+            return 0;
+        }
+
+        for (Py_ssize_t col = 0; col < self->num_cols; col++) {
+            PyObject* value = PyTuple_GetItem(row_tuple, col);
+            void* buffer = self->columns[col].buffer;
+            SQLLEN* indicator = self->columns[col].indicator;
+
+            if (value == Py_None) {
+                indicator[row] = SQL_NULL_DATA;
+                Py_CLEAR(self->columns[col].converted[row]);
+                continue;
+            }
+
+            if (!PyObject_IsInstance(value, (PyObject*)self->columns[col].py_type)) {
+                for (Py_ssize_t c = 0; c < self->num_cols; c++) {
+                    for (Py_ssize_t r = 0; r <= row; r++)
+                        Py_CLEAR(self->columns[c].converted[r]);
+                }
+                Py_DECREF(rows);
+                PyErr_SetString(PyExc_TypeError, "Inconsistent column type in row data");
+                return 0;
+            }
+
+            self->columns[col].converted[row] = 0;
+            SQLULEN col_size;
+            SQLSMALLINT decimal_digits;
+            SQLSMALLINT sql_c_type;
+            SQLSMALLINT sql_type = DetectCType(value, &col_size, &decimal_digits, &sql_c_type, &self->columns[col].converted[row]);
+            if (sql_type != self->columns[col].sql_type) {
+                for (Py_ssize_t c = 0; c < self->num_cols; c++) {
+                    for (Py_ssize_t r = 0; r <= row; r++)
+                        Py_CLEAR(self->columns[c].converted[r]);
+                }
+                Py_DECREF(rows);
+                PyErr_SetString(PyExc_TypeError, "Inconsistent SQL type in row data");
+                return 0;
+            }
+
+            switch (self->columns[col].sql_type) {
+                case SQLCHAR: {
+                    char* str_value = PyUnicode_AsUTF8(self->columns[col].converted[row] ? self->columns[col].converted[row] : value);
+                    if (!str_value) {
+                        for (Py_ssize_t c = 0; c < self->num_cols; c++) {
+                            for (Py_ssize_t r = 0; r <= row; r++)
+                                Py_CLEAR(self->columns[c].converted[r]);
+                        }
+                        Py_DECREF(rows);
+                        return 0;
+                    }
+                    strncpy((char*)buffer + row * (self->columns[col].col_size + 1), str_value, self->columns[col].col_size);
+                    indicator[row] = SQL_NTS;
+                    break;
+                }
+                case SQLINT: {
+                    ((SQLINTEGER*)buffer)[row] = (SQLINTEGER)PyLong_AsLong(value);
+                    indicator[row] = sizeof(SQLINTEGER);
+                    break;
+                }
+                case SQLFLT8: {
+                    ((SQLDOUBLE*)buffer)[row] = PyFloat_AsDouble(value);
+                    indicator[row] = sizeof(SQLDOUBLE);
+                    break;
+                }
+                case SQLDATETIME: {
+                    SQL_TIMESTAMP_STRUCT* ts = &((SQL_TIMESTAMP_STRUCT*)buffer)[row];
+                    ts->year = PyDateTime_GET_YEAR(value);
+                    ts->month = PyDateTime_GET_MONTH(value);
+                    ts->day = PyDateTime_GET_DAY(value);
+                    ts->hour = PyDateTime_DATE_GET_HOUR(value);
+                    ts->minute = PyDateTime_DATE_GET_MINUTE(value);
+                    ts->second = PyDateTime_DATE_GET_SECOND(value);
+                    ts->fraction = PyDateTime_DATE_GET_MICROSECOND(value) * 1000;
+                    indicator[row] = sizeof(SQL_TIMESTAMP_STRUCT);
+                    break;
+                }
+            }
+        }
+
+        RETCODE rc = self->bcp_sendrow(self->hdbc);
+        if (!SQL_SUCCEEDED(rc)) {
+            for (Py_ssize_t col = 0; col < self->num_cols; col++) {
+                for (Py_ssize_t r = 0; r <= row; r++)
+                    Py_CLEAR(self->columns[col].converted[r]);
+            }
+            Py_DECREF(rows);
+            RaiseErrorFromHandle(self, "bcp_sendrow", 0, self->hdbc, 0);
+            return 0;
+        }
+    }
+
+    for (Py_ssize_t col = 0; col < self->num_cols; col++) {
+        for (Py_ssize_t r = 0; r < num_rows; r++)
+            Py_CLEAR(self->columns[col].converted[r]);
+    }
+
+    Py_DECREF(rows);
+    Py_RETURN_NONE;
+}
+
+// Commit a batch of rows
+static PyObject* Connection_bcp_batch(Connection* self)
+{
+    if (!self->bcp_initialized) {
+        PyErr_SetString(PyExc_ValueError, "BCP not initialized");
+        return 0;
+    }
+
+    DBINT rows_committed = self->bcp_batch(self->hdbc);
+    if (rows_committed == -1) {
+        RaiseErrorFromHandle(self, "bcp_batch", 0, self->hdbc, 0);
+        return 0;
+    }
+
+    return PyLong_FromLong((long)rows_committed);
+}
+
+// Finalize BCP operation
+static PyObject* Connection_bcp_done(Connection* self)
+{
+    if (!self->bcp_initialized) {
+        PyErr_SetString(PyExc_ValueError, "BCP not initialized");
+        return 0;
+    }
+
+    cleanup_columns(self);
+
+    DBINT rows_processed = self->bcp_done(self->hdbc);
+    if (rows_processed == -1) {
+        RaiseErrorFromHandle(self, "bcp_done", 0, self->hdbc, 0);
+        return 0;
+    }
+
+    self->bcp_initialized = FALSE;
+    return PyLong_FromLong((long)rows_processed);
+}
 
 static char enter_doc[] = "__enter__() -> self.";
 static PyObject* Connection_enter(PyObject* self, PyObject* args)
@@ -1379,6 +1758,11 @@ static struct PyMethodDef Connection_methods[] =
     { "set_attr",                Connection_set_attr,        METH_VARARGS, set_attr_doc   },
     { "__enter__",               Connection_enter,           METH_NOARGS,  enter_doc      },
     { "__exit__",                Connection_exit,            METH_VARARGS, exit_doc       },
+    {"bcp_init", (PyCFunction)Connection_bcp_init, METH_VARARGS, "Initialize BCP operation for a table"},
+    {"bcp_bind", (PyCFunction)Connection_bcp_bind, METH_VARARGS, "Bind columns for bulk copy with optional batch size"},
+    {"bcp_sendrow", (PyCFunction)Connection_bcp_sendrow, METH_VARARGS, "Send a single row or chunk of rows for bulk copy"},
+    {"bcp_batch", (PyCFunction)Connection_bcp_batch, METH_NOARGS, "Commit a batch of rows and return rows committed"},
+    {"bcp_done", (PyCFunction)Connection_bcp_done, METH_NOARGS, "Finalize BCP operation and return rows processed"},
 
     { 0, 0, 0, 0 }
 };

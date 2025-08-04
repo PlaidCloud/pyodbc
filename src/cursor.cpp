@@ -319,6 +319,71 @@ enum free_results_flags
     PREPARED_MASK  = 0x0C
 };
 
+
+static int parse_insert_sql(const char* sql, char* table_name, size_t table_name_len)
+{
+    const char* insert = strstr(sql, "INSERT INTO ");
+    if (!insert) return 0;
+    insert += strlen("INSERT INTO ");
+
+    // Skip whitespace
+    while (*insert == ' ' || *insert == '\t' || *insert == '\n' || *insert == '\r')
+        insert++;
+
+    if (!*insert) return 0;
+
+    // Initialize buffer for table name
+    char temp[256] = {0};
+    size_t pos = 0;
+    int in_quotes = 0;
+    char quote_char = 0;
+
+    // Parse schema (if present) and table name
+    while (*insert && pos < sizeof(temp) - 1) {
+        if (!in_quotes && (*insert == '[' || *insert == '"')) {
+            in_quotes = 1;
+            quote_char = *insert;
+            insert++;
+            continue;
+        }
+        if (in_quotes && *insert == quote_char) {
+            in_quotes = 0;
+            insert++;
+            continue;
+        }
+        if (!in_quotes && (*insert == '.' || *insert == '(')) {
+            break; // End of table name or schema
+        }
+        if (!in_quotes && (*insert == ' ' || *insert == '\t' || *insert == '\n' || *insert == '\r')) {
+            insert++;
+            continue; // Skip whitespace outside quotes
+        }
+        temp[pos++] = *insert++;
+    }
+
+    if (pos == 0 || in_quotes) return 0; // Empty or unclosed quotes
+    temp[pos] = '\0';
+
+    // Check for schema (e.g., "dbo.table" or "[dbo].[table]")
+    char* table_start = temp;
+    char* dot = strchr(temp, '.');
+    if (dot) {
+        table_start = dot + 1; // Skip schema
+    }
+
+    // Verify table name ends at parenthesis
+    if (*insert != '(') return 0;
+
+    // Copy table name to output
+    size_t table_len = strlen(table_start);
+    if (table_len == 0 || table_len >= table_name_len) return 0;
+    strncpy(table_name, table_start, table_name_len);
+    table_name[table_name_len - 1] = '\0';
+
+    return 1;
+}
+
+
 static bool free_results(Cursor* self, int flags)
 {
     // Internal function called any time we need to free the memory associated with query results.  It is safe to call
@@ -1061,6 +1126,16 @@ static PyObject* Cursor_executemany(PyObject* self, PyObject* args)
             PyErr_SetString(ProgrammingError, "The second parameter to executemany must not be empty.");
             return 0;
         }
+
+        // Check if BCP is enabled and available, and this is an insert
+        char table_name[256] = {0};
+        if (cursor->fastbcp && cursor->cnxn->bcp_init && parse_insert_sql(pSql, table_name, sizeof(table_name))
+        {
+            if (!ExecuteBCP(cursor, pSql, param_seq))
+                return 0;
+        }
+
+
         if (cursor->fastexecmany)
         {
             free_results(cursor, FREE_STATEMENT | KEEP_PREPARED);

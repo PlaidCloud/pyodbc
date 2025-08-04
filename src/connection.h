@@ -94,6 +94,17 @@ struct Connection
     // Unfortunately each lookup requires creating a Python object.  To bypass this when output
     // converters are not used, we keep this pointer null until the first converter is added,
     // which is fast to check.
+
+    bool bcp_initialized; // Track BCP initialization state
+    struct ColumnInfo* columns; // Store column bindings
+    Py_ssize_t num_cols; // Number of columns
+    Py_ssize_t batch_size; // Number of rows to buffer
+    // BCP function pointers
+    bcp_init_t bcp_init;
+    bcp_bind_t bcp_bind;
+    bcp_sendrow_t bcp_sendrow;
+    bcp_batch_t bcp_batch;
+    bcp_done_t bcp_done;
 };
 
 #define Connection_Check(op) PyObject_TypeCheck(op, &ConnectionType)

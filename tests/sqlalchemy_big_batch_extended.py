@@ -20,7 +20,7 @@ SQL_BCP_ON = 1
 # ---------- CONFIG ----------
 # Adjust connection string as needed
 CONN_URL = (
-    "mssql+pyodbc://sa:YourStrong!Passw0rd@localhost,1433/BcpTest"
+    "mssql+pyodbc://plaidcloud:OwMImc^FcCR6k2*zIC#Y@plaidcloud-testing.database.windows.net:1433/testing" #'DSN=pyodbc-sqlserver;UID=plaidcloud;PWD=OwMImc^FcCR6k2*zIC#Y;'
     "?driver=ODBC+Driver+18+for+SQL+Server&Encrypt=no"
 )
 TOTAL_ROWS   = 50_000
@@ -212,7 +212,7 @@ def bulk_insert(engine, use_bcp: bool, total_rows: int, chunk_rows: int):
                     next_id += n
                     remaining -= n
         else:
-            with engine.begin() as conn:
+            with engine.connect() as conn:
                 ins = insert(t)
 
                 remaining = total_rows
@@ -251,7 +251,7 @@ def verify_count(engine, expected: int):
 
 def main():
     # NORMAL
-    eng_normal = make_engine(use_sa_fast_executemany=False)
+    eng_normal = make_engine(use_sa_fast_executemany=True)
     ensure_table(eng_normal)
     bulk_insert(eng_normal, use_bcp=False, total_rows=TOTAL_ROWS, chunk_rows=CHUNK_ROWS)
     verify_count(eng_normal, TOTAL_ROWS)

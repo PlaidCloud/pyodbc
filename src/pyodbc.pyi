@@ -3,7 +3,7 @@
 from __future__ import annotations
 from collections.abc import Generator, Iterable, Iterator, Sequence
 from typing import Any, Callable, Final, Union
-
+import ctypes
 
 # SQLSetConnectAttr attributes
 # ref: https://docs.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetconnectattr-function
@@ -294,6 +294,11 @@ SQL_UNION: int
 SQL_USER_NAME: int
 SQL_XOPEN_CLI_YEAR: int
 
+# driver connect completion modes
+SQL_DRIVER_COMPLETE: int
+SQL_DRIVER_COMPLETE_REQUIRED: int
+SQL_DRIVER_NOPROMPT: int
+SQL_DRIVER_PROMPT: int
 
 # pyodbc-specific constants
 BinaryNull: Any  # to distinguish binary NULL values from char NULL values
@@ -308,6 +313,7 @@ apilevel: Final[str] = '2.0'
 paramstyle: Final[str] = 'qmark'
 threadsafety: Final[int] = 1
 version: Final[str]  # not pep-0249
+henv: Final[ctypes.c_void_p]
 
 # read-write (not pep-0249)
 lowercase: bool = False
@@ -356,12 +362,49 @@ class Connection:
         ...
 
     @property
+    def fetch_decimal_as_string(self) -> bool:
+        """If True, DECIMAL and NUMERIC values will be fetched as strings using the
+        legacy local-aware path.  If False (the default), values are fetched using a
+        binary representation that is not affected by the locale."""
+        ...
+
+    @fetch_decimal_as_string.setter
+    def fetch_decimal_as_string(self, value: bool) -> None:
+        ...
+
+    @property
+    def hdbc(self) -> ctypes.c_void_p | None:
+        """ODBC handle for the connection."""
+        ...
+
+    @property
+    def compat_diagrec_byte_length(self) -> bool:
+        """Set to True if the driver incorrectly reports byte length instead of
+        character length for diagnostic messages.
+
+        See https://github.com/mkleehammer/pyodbc/issues/489."""
+        ...
+
+    @compat_diagrec_byte_length.setter
+    def compat_diagrec_byte_length(self, value: bool) -> None:
+        ...
+
+    @property
     def maxwrite(self) -> int:
         """The maximum bytes to write before using SQLPutData, default is zero for no maximum."""
         ...
 
     @maxwrite.setter
     def maxwrite(self, value: int) -> None:
+        ...
+
+    @property
+    def readvar_initsize(self) -> int:
+        """The initial buffer size in bytes for reading values from variable-length columns."""
+        ...
+
+    @readvar_initsize.setter
+    def readvar_initsize(self, value: int) -> None:
         ...
 
     @property
@@ -427,7 +470,7 @@ class Connection:
         """
         ...
 
-    def set_attr(self, attr_id: int, value: int, /) -> None:
+    def set_attr(self, attr_id: int, value: int | str, /) -> None:
         """Set an attribute on the connection, via SQLSetConnectAttr.
 
         Args:
@@ -565,6 +608,20 @@ class Cursor:
 
     @fast_executemany.setter
     def fast_executemany(self, value: bool) -> None:
+        ...
+
+    @property
+    def rows_as_dicts(self) -> bool:
+        """If True, rows are returned as dicts instead of Row objects."""
+        ...
+
+    @rows_as_dicts.setter
+    def rows_as_dicts(self, value: bool) -> None:
+        ...
+
+    @property
+    def hstmt(self) -> ctypes.c_void_p | None:
+        """ODBC handle for the statement."""
         ...
 
     @property
@@ -743,6 +800,23 @@ class Cursor:
 
         Returns:
             The cursor object, containing table information in the result set.
+        """
+        ...
+
+    def tablePrivileges(self,
+                        table: str | None = None,
+                        catalog: str | None = None,
+                        schema: str | None = None) -> Cursor:
+        """Return information about privileges granted for the tables in the
+        database.
+
+        Args:
+            table: Name of the database table.
+            catalog: Name of the catalog (database).
+            schema: Name of the table schema.
+
+        Returns:
+            The cursor object, containing table privilege info in the result set.
         """
         ...
 
@@ -945,9 +1019,12 @@ class Row:
 
 # module functions
 
-def dataSources() -> dict[str, str]:
+def dataSources(*, scope: str | None = None) -> dict[str, str]:
     """Return all available Data Source Names (DSNs), typically from the odbcinst.ini file
     or the Windows ODBC Data Source Administrator.
+
+    Args:
+        scope: optional filter ("user" or "system") to control which DSNs are returned.
 
     Returns:
         A dictionary of DSNs and their textual descriptions.
@@ -999,6 +1076,9 @@ def connect(connstring: str | None = None,
         readonly: To set the connection read-only.  Not all drivers and/or databases support this.
         timeout: Set the connection timeout, in seconds.  This is managed by the driver, not
             pyodbc, and not all drivers support this.
+        driver_completion: One of SQL_DRIVER_PROMPT (only available on Windows),
+            SQL_DRIVER_NO_PROMPT (the default), SQL_DRIVER_COMPLETE, or
+            SQL_DRIVER_COMPLETE_REQUIRED.
         attrs_before: Set low-level connection attributes before a connection is attempted.
         **kwargs: These key/value pairs are used to construct the connection string, or add
             to it (as "key=value;" combinations).

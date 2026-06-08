@@ -109,9 +109,6 @@ inline void _strlwr(char* name)
 #define CDECL
 #endif
 
-#define STRINGIFY(x) #x
-#define TOSTRING(x) STRINGIFY(x)
-
 #ifdef PYODBC_TRACE
 void DebugTrace(const char* szFmt, ...);
 #else

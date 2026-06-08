@@ -3,6 +3,7 @@ Unit tests for PostgreSQL
 """
 # -*- coding: utf-8 -*-
 
+import ctypes
 import os, uuid
 from decimal import Decimal
 from typing import Iterator
@@ -62,15 +63,19 @@ def _generate_str(length, encoding=None):
 
 def test_text(cursor: pyodbc.Cursor):
     cursor.execute("create table t1(col text)")
+    assert cursor.connection.readvar_initsize == 4096
 
     # Two different read code paths exist based on the length.  Using 100 and 4000 will ensure
     # both are tested.
-    for length in [None, 0, 100, 1000, 4000]:
-        cursor.execute("truncate table t1")
-        param = _generate_str(length)
-        cursor.execute("insert into t1 values (?)", param)
-        result = cursor.execute("select col from t1").fetchval()
-        assert result == param
+    for initsize in [None, 1024 * 1024, 0]:
+        if initsize is not None:
+            cursor.connection.readvar_initsize = initsize
+        for length in [None, 0, 100, 1000, 4000]:
+            cursor.execute("truncate table t1")
+            param = _generate_str(length)
+            cursor.execute("insert into t1 values (?)", param)
+            result = cursor.execute("select col from t1").fetchval()
+            assert result == param
 
 
 def test_text_many(cursor: pyodbc.Cursor):
@@ -167,11 +172,13 @@ def test_decimal(cursor: pyodbc.Cursor):
     params = [Decimal(n) for n in "-1000.10 -1234.56 -1 0 1 1000.10 1234.56 100010 123456789.21".split()]
     params.append(None)
 
-    for param in params:
-        cursor.execute("truncate table t1")
-        cursor.execute("insert into t1 values (?)", param)
-        result = cursor.execute("select col from t1").fetchval()
-        assert result == param
+    for mode in (True, False):
+        cursor.connection.fetch_decimal_as_string = mode
+        for param in params:
+            cursor.execute("truncate table t1")
+            cursor.execute("insert into t1 values (?)", param)
+            result = cursor.execute("select col from t1").fetchval()
+            assert result == param
 
 
 def test_numeric(cursor: pyodbc.Cursor):
@@ -181,11 +188,13 @@ def test_numeric(cursor: pyodbc.Cursor):
     params = [Decimal(n) for n in "-1234.56  -1  0  1  1234.56  123456789.21".split()]
     params.append(None)
 
-    for param in params:
-        cursor.execute("truncate table t1")
-        cursor.execute("insert into t1 values (?)", param)
-        result = cursor.execute("select col from t1").fetchval()
-        assert result == param
+    for mode in (True, False):
+        cursor.connection.fetch_decimal_as_string = mode
+        for param in params:
+            cursor.execute("truncate table t1")
+            cursor.execute("insert into t1 values (?)", param)
+            result = cursor.execute("select col from t1").fetchval()
+            assert result == param
 
 
 def test_maxwrite(cursor: pyodbc.Cursor):
@@ -490,6 +499,20 @@ def test_columns(cursor: pyodbc.Cursor):
     assert row.type_name == 'varchar'
     assert _get_column_size(row) == 3
 
+
+def test_table_privileges(cursor: pyodbc.Cursor):
+    # Confirm exposure of SQLTablePrivileges.  We're limited in what we can test, as
+    # we can't control whether we're running with permission to create users or grant
+    # permissions.  We can at least verify that the method generates a results set
+    # with the right columns.
+    cols = ["table_cat", "table_schem", "table_name", "grantor",
+            "grantee", "privilege", "is_grantable"]
+    cursor.tablePrivileges()
+    names = [col[0] for col in cursor.description]
+    assert len(cols) == len(names), "privileges results set has the wrong shape"
+    assert cols == names, "unexpected column names for privileges results set"
+
+
 def test_cancel(cursor: pyodbc.Cursor):
     # I'm not sure how to reliably cause a hang to cancel, so for now we'll settle with
     # making sure SQLCancel is called correctly.
@@ -620,3 +643,64 @@ def test_refcount_encoding():
     count_after = sys.getrefcount(encoding)
 
     assert count_after == count_before
+
+
+def test_rows_as_dicts(cursor: pyodbc.Cursor):
+    """Test enhancement for ticket #171"""
+
+    # Create and populate a test table.
+    cursor.execute("create table t1 (id int, name varchar(20))")
+    cursor.execute("insert into t1 values (42, 'Kathleen')")
+
+    # Verify the default behavior
+    assert cursor.rows_as_dicts is False
+    row = cursor.execute("select * from t1").fetchone()
+    assert not isinstance(row, dict)
+    assert isinstance(row, pyodbc.Row)
+    assert isinstance(row[0], int)
+    assert isinstance(row[1], str)
+    assert len(row) == 2
+    with pytest.raises(TypeError, match="row indices must be integers"):
+        print(row["name"])
+
+    # Test the dict option
+    cursor.rows_as_dicts = True
+    row = cursor.execute("select * from t1").fetchone()
+    assert not isinstance(row, pyodbc.Row)
+    assert isinstance(row, dict)
+    assert row == {"id": 42, "name": "Kathleen"}
+    assert isinstance(row["id"], int)
+    assert isinstance(row["name"], str)
+    assert len(row) == 2
+    with pytest.raises(KeyError):
+        print(row[1])
+
+    # Test aliasing
+    row = cursor.execute("select name as n1, name as n2 from t1").fetchone()
+    assert len(row) == 2
+    assert row == {"n1": "Kathleen", "n2": "Kathleen"}
+    with pytest.raises(KeyError):
+        print(row["name"])
+
+    # Test with a duplicate name
+    row = cursor.execute("select name, name from t1").fetchone()
+    assert len(row) == 1
+    assert row == {"name": "Kathleen"}
+
+
+def test_handles(cursor: pyodbc.Cursor):
+    """Test the exposed native ODBC handles"""
+
+    conn = cursor.connection
+    for handle in (pyodbc.henv, conn.hdbc, cursor.hstmt):
+        assert isinstance(handle, ctypes.c_void_p)
+        with pytest.raises(TypeError):
+            if handle > 42:
+                print("we should never get here")
+    cursor.close()
+    assert not isinstance(cursor.hstmt, ctypes.c_void_p)
+    assert cursor.hstmt is None
+    assert isinstance(conn.hdbc, ctypes.c_void_p)
+    conn.close()
+    assert not isinstance(conn.hdbc, ctypes.c_void_p)
+    assert conn.hdbc is None

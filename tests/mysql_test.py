@@ -3,6 +3,7 @@ pytest unit tests for MySQL.  Uses a DNS name 'mysql' and uses UTF-8
 """
 # -*- coding: utf-8 -*-
 
+import ctypes
 import os
 from decimal import Decimal
 from datetime import date, datetime
@@ -67,17 +68,20 @@ def test_blob(cursor: pyodbc.Cursor):
 
 
 def _test_vartype(cursor, datatype):
+    assert cursor.connection.readvar_initsize == 4096
     cursor.execute(f"create table t1(c1 {datatype}(4000))")
+    for initsize in [None, 1024 * 1024, 0]:
+        if initsize is not None:
+            cursor.connection.readvar_initsize = initsize
+        for length in [None, 0, 100, 1000, 4000]:
+            cursor.execute("delete from t1")
 
-    for length in [None, 0, 100, 1000, 4000]:
-        cursor.execute("delete from t1")
+            encoding = (datatype in ('blob', 'varbinary')) and 'utf8' or None
+            value = _generate_str(length, encoding=encoding)
 
-        encoding = (datatype in ('blob', 'varbinary')) and 'utf8' or None
-        value = _generate_str(length, encoding=encoding)
-
-        cursor.execute("insert into t1 values(?)", value)
-        v = cursor.execute("select * from t1").fetchone()[0]
-        assert v == value
+            cursor.execute("insert into t1 values(?)", value)
+            v = cursor.execute("select * from t1").fetchone()[0]
+            assert v == value
 
 
 def test_char(cursor: pyodbc.Cursor):
@@ -117,13 +121,15 @@ def test_decimal(cursor: pyodbc.Cursor):
         ('-10.0010', '19,4')
     ]
 
-    for value, prec in tests:
-        value = Decimal(value)
-        cursor.execute("drop table if exists t1")
-        cursor.execute(f"create table t1(c1 numeric({prec}))")
-        cursor.execute("insert into t1 values (?)", value)
-        v = cursor.execute("select c1 from t1").fetchone()[0]
-        assert v == value
+    for mode in (True, False):
+        cursor.connection.fetch_decimal_as_string = mode
+        for value, prec in tests:
+            value = Decimal(value)
+            cursor.execute("drop table if exists t1")
+            cursor.execute(f"create table t1(c1 numeric({prec}))")
+            cursor.execute("insert into t1 values (?)", value)
+            v = cursor.execute("select c1 from t1").fetchone()[0]
+            assert v == value
 
 
 def test_multiple_bindings(cursor: pyodbc.Cursor):
@@ -353,6 +359,19 @@ def test_row_description(cursor: pyodbc.Cursor):
     assert cursor.description == row.cursor_description
 
 
+def test_table_privileges(cursor: pyodbc.Cursor):
+    # Confirm exposure of SQLTablePrivileges.  We're limited in what we can test, as
+    # we can't control whether we're running with permission to create users or grant
+    # permissions.  We can at least verify that the method generates a results set
+    # with the right columns.
+    cols = ["table_cat", "table_schem", "table_name", "grantor",
+            "grantee", "privilege", "is_grantable"]
+    cursor.tablePrivileges()
+    names = [col[0] for col in cursor.description]
+    assert len(cols) == len(names), "privileges results set has the wrong shape"
+    assert cols == names, "unexpected column names for privileges results set"
+
+
 def test_executemany(cursor: pyodbc.Cursor):
     cursor.execute("create table t1(a int, b varchar(10))")
 
@@ -489,3 +508,21 @@ def _generate_str(length, encoding=None):
     v = v[:length]
 
     return v
+
+
+def test_handles(cursor: pyodbc.Cursor):
+    """Test the exposed native ODBC handles"""
+
+    conn = cursor.connection
+    for handle in (pyodbc.henv, conn.hdbc, cursor.hstmt):
+        assert isinstance(handle, ctypes.c_void_p)
+        with pytest.raises(TypeError):
+            if handle > 42:
+                print("we should never get here")
+    cursor.close()
+    assert not isinstance(cursor.hstmt, ctypes.c_void_p)
+    assert cursor.hstmt is None
+    assert isinstance(conn.hdbc, ctypes.c_void_p)
+    conn.close()
+    assert not isinstance(conn.hdbc, ctypes.c_void_p)
+    assert conn.hdbc is None

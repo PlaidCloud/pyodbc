@@ -31,6 +31,13 @@ struct ColumnInfo
     // of the integer types are the same size whether signed and unsigned, so we can allocate memory ahead of time
     // without knowing this.  We use this during the fetch when converting to a Python integer or long.
     bool is_unsigned;
+
+    // For SQL_DECIMAL/SQL_NUMERIC columns: scale from SQLDescribeCol, and whether
+    // the binary (SQL_C_NUMERIC) fetch path can be used for this column.
+    // use_decimal_binary is false if scale is outside [0, 127] (doesn't fit in
+    // SQL_NUMERIC_STRUCT.scale or is negative) or if the driver failed ARD setup.
+    SQLSMALLINT scale;
+    bool use_decimal_binary;
 };
 
 struct ParamInfo
@@ -91,6 +98,16 @@ struct Cursor
     // Set to SQL_NULL_HANDLE when the cursor is closed.
     HSTMT hstmt;
 
+    // If true, fast executemany will default to using BCP if available.
+    bool use_bcp_fast = false;
+    
+    // BCP configuration
+    long bcp_batch_rows = 0;            // amount of rows per batch, 0 means driver default (no batching)
+
+    // If true, the BCP fast path passes the TABLOCK hint, which enables a bulk-update
+    // lock and (with a SIMPLE/BULK_LOGGED recovery model + heap) minimal logging.
+    bool bcp_tablock = false;
+
     //
     // SQL Parameters
     //
@@ -117,16 +134,19 @@ struct Cursor
 
     // Parameter set array (used with executemany)
     unsigned char *paramArray;
-    
+
     // Whether to use fast executemany with parameter arrays and other optimisations
     char fastexecmany;
-    
+
     // The list of information for setinputsizes().
     PyObject *inputsizes;
 
     //
     // Result Information
     //
+
+    // If true, return rows as dicts instead of Row objects.
+    char rows_as_dicts;
 
     // An array of ColumnInfos, allocated via malloc.  This will be zero when closed or when there are no query
     // results.

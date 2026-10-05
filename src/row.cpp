@@ -107,7 +107,7 @@ static PyObject* new_check(PyObject* args)
 
     Py_ssize_t cols = PyTuple_GET_SIZE(desc);
 
-    if (PyDict_Size(map) != cols || PyTuple_GET_SIZE(args) - 2 != cols)
+    if (PyTuple_GET_SIZE(args) - 2 != cols)
         return 0;
 
     PyObject** apValues = (PyObject**)PyMem_Malloc(sizeof(PyObject*) * cols);

@@ -234,6 +234,9 @@ PyObject* GetErrorFromHandle(Connection *conn, const char* szFunction, HDBC hdbc
 
     Object msg;
 
+    // See https://github.com/mkleehammer/pyodbc/issues/489
+    bool text_length_in_bytes = conn->compat_diagrec_byte_length;
+
     for (;;)
     {
         szMsg[0]     = 0;
@@ -248,6 +251,10 @@ PyObject* GetErrorFromHandle(Connection *conn, const char* szFunction, HDBC hdbc
         if (!SQL_SUCCEEDED(ret))
             break;
 
+        // Make sure the text length counts characters, not bytes.
+        if (text_length_in_bytes)
+            cchMsg /= sizeof(uint16_t);
+
         // If needed, allocate a bigger error message buffer and retry.
         if (cchMsg > msgLen - 1) {
             msgLen = cchMsg + 1;
@@ -261,6 +268,8 @@ PyObject* GetErrorFromHandle(Connection *conn, const char* szFunction, HDBC hdbc
             Py_END_ALLOW_THREADS
             if (!SQL_SUCCEEDED(ret))
                 break;
+            if (text_length_in_bytes)
+                cchMsg /= sizeof(uint16_t);
         }
 
         // Not always NULL terminated (MS Access)

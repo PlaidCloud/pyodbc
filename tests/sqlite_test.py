@@ -16,6 +16,7 @@ Then run the unit tests with:
 python -m pytest tests/sqlite_test.py
 """
 
+import ctypes
 import os
 import pathlib
 import pickle
@@ -138,31 +139,36 @@ def _test_strtype(cursor: pyodbc.Cursor, sqltype, value, colsize=None):
     The implementation for string, Unicode, and binary tests.
     """
     assert colsize is None or (value is None or colsize >= len(value))
+    assert cursor.connection.readvar_initsize == 4096
 
-    if colsize:
-        sql = "create table t1(s {}({}))".format(sqltype, colsize)
-    else:
-        sql = "create table t1(s {})".format(sqltype)
+    for initsize in [None, 1024 * 1024, 0]:
+        if initsize is not None:
+            cursor.connection.readvar_initsize = initsize
+        if colsize:
+            sql = "create table t1(s {}({}))".format(sqltype, colsize)
+        else:
+            sql = "create table t1(s {})".format(sqltype)
 
-    cursor.execute(sql)
-    cursor.execute("insert into t1 values(?)", value)
-    v = cursor.execute("select * from t1").fetchone()[0]
-    assert type(v) is type(value)
+        cursor.execute(sql)
+        cursor.execute("insert into t1 values(?)", value)
+        v = cursor.execute("select * from t1").fetchone()[0]
+        assert type(v) is type(value)
 
-    if value is not None:
-        assert len(v) == len(value)
+        if value is not None:
+            assert len(v) == len(value)
 
-    assert v == value
+        assert v == value
 
-    # Reported by Andy Hochhaus in the pyodbc group: In 2.1.7 and earlier, a hardcoded length of 255 was used to
-    # determine whether a parameter was bound as a SQL_VARCHAR or SQL_LONGVARCHAR.  Apparently SQL Server chokes if
-    # we bind as a SQL_LONGVARCHAR and the target column size is 8000 or less, which is considers just SQL_VARCHAR.
-    # This means binding a 256 character value would cause problems if compared with a VARCHAR column under
-    # 8001. We now use SQLGetTypeInfo to determine the time to switch.
-    #
-    # [42000] [Microsoft][SQL Server Native Client 10.0][SQL Server]The data types varchar and text are incompatible in the equal to operator.
+        # Reported by Andy Hochhaus in the pyodbc group: In 2.1.7 and earlier, a hardcoded length of 255 was used to
+        # determine whether a parameter was bound as a SQL_VARCHAR or SQL_LONGVARCHAR.  Apparently SQL Server chokes if
+        # we bind as a SQL_LONGVARCHAR and the target column size is 8000 or less, which is considers just SQL_VARCHAR.
+        # This means binding a 256 character value would cause problems if compared with a VARCHAR column under
+        # 8001. We now use SQLGetTypeInfo to determine the time to switch.
+        #
+        # [42000] [Microsoft][SQL Server Native Client 10.0][SQL Server]The data types varchar and text are incompatible in the equal to operator.
 
-    cursor.execute("select * from t1 where s=?", value)
+        cursor.execute("select * from t1 where s=?", value)
+        cursor.execute("drop table t1")
 
 
 def _test_strliketype(cursor: pyodbc.Cursor, sqltype, value, colsize=None):
@@ -726,3 +732,70 @@ def test_pickling(cnxn: pyodbc.Connection):
     pickled_rows = pickle.dumps(original_rows)
     unpickled_rows = pickle.loads(pickled_rows)
     assert unpickled_rows == original_rows
+
+    # pickling works for rows with duplicate column names
+    original_rows = crsr.execute("select n, s, s from t1").fetchall()
+    pickled_rows = pickle.dumps(original_rows)
+    unpickled_rows = pickle.loads(pickled_rows)
+    assert unpickled_rows == original_rows
+
+
+def test_handles(cursor: pyodbc.Cursor):
+    """Test the exposed native ODBC handles"""
+
+    conn = cursor.connection
+    for handle in (pyodbc.henv, conn.hdbc, cursor.hstmt):
+        assert isinstance(handle, ctypes.c_void_p)
+        with pytest.raises(TypeError):
+            if handle > 42:
+                print("we should never get here")
+    cursor.close()
+    assert not isinstance(cursor.hstmt, ctypes.c_void_p)
+    assert cursor.hstmt is None
+    assert isinstance(conn.hdbc, ctypes.c_void_p)
+    conn.close()
+    assert not isinstance(conn.hdbc, ctypes.c_void_p)
+    assert conn.hdbc is None
+
+
+def test_rows_as_dicts(cursor: pyodbc.Cursor):
+    """Test enhancement for ticket #171"""
+
+    # Create and populate a test table.
+    cursor.execute("create table t1 (id int, name varchar(20))")
+    cursor.execute("insert into t1 values (42, 'Kathleen')")
+
+    # Verify the default behavior
+    assert cursor.rows_as_dicts is False
+    row = cursor.execute("select * from t1").fetchone()
+    assert not isinstance(row, dict)
+    assert isinstance(row, pyodbc.Row)
+    assert isinstance(row[0], int)
+    assert isinstance(row[1], str)
+    assert len(row) == 2
+    with pytest.raises(TypeError, match="row indices must be integers"):
+        print(row["name"])
+
+    # Test the dict option
+    cursor.rows_as_dicts = True
+    row = cursor.execute("select * from t1").fetchone()
+    assert not isinstance(row, pyodbc.Row)
+    assert isinstance(row, dict)
+    assert row == {"id": 42, "name": "Kathleen"}
+    assert isinstance(row["id"], int)
+    assert isinstance(row["name"], str)
+    assert len(row) == 2
+    with pytest.raises(KeyError):
+        print(row[1])
+
+    # Test aliasing
+    row = cursor.execute("select name as n1, name as n2 from t1").fetchone()
+    assert len(row) == 2
+    assert row == {"n1": "Kathleen", "n2": "Kathleen"}
+    with pytest.raises(KeyError):
+        print(row["name"])
+
+    # Test with a duplicate name
+    row = cursor.execute("select name, name from t1").fetchone()
+    assert len(row) == 1
+    assert row == {"name": "Kathleen"}

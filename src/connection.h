@@ -12,6 +12,8 @@
 #ifndef CONNECTION_H
 #define CONNECTION_H
 
+struct BcpProcs;
+
 struct Cursor;
 
 extern PyTypeObject ConnectionType;
@@ -32,6 +34,11 @@ struct Connection
     char odbc_major;
     char odbc_minor;
 
+    // BCP support, loaded on demand.
+    // If bcp.loaded is false, BCP is not supported.
+    // If bcp.loaded is true, all function pointers are valid.
+    BcpProcs* bcp;
+
     // The escape character from SQLGetInfo.  This is not initialized until requested, so this may be zero!
     PyObject* searchescape;
 
@@ -39,8 +46,17 @@ struct Connection
     // to insert NULLs into binary columns.
     bool supports_describeparam;
 
+    // Set to true if the driver doesn't handle SQL_NUMERIC_STRUCT properly.
+    bool fetch_decimal_as_string;
+
     // The column size of datetime columns, obtained from SQLGetInfo(), used to determine the datetime precision.
     int datetime_precision;
+
+    // Initial buffer allocation size for ReadVarColumn
+    // Any integer greater than 0 overrides the default value of 4096
+    // < 1 means use columnSize * cbElement + cbNullTeminator from the column descriptor,
+    // up to a ceiling of 32 MB. See https://github.com/mkleehammer/pyodbc/issues/1071.
+    Py_ssize_t readvar_initsize;
 
     // The connection timeout in seconds.
     long timeout;
@@ -87,6 +103,11 @@ struct Connection
 
     bool need_long_data_len;
 
+    // Flag for drivers which report the number of bytes in the returned diagnostic message
+    // from a call to SQLGetDiagRecW() rather than the number of characters, as required
+    // by ODBC. See https://github.com/mkleehammer/pyodbc/issues/489.
+    bool compat_diagrec_byte_length;
+
     PyObject* map_sqltype_to_converter;
     // If converters are defined, this will be a dictionary mapping from the SQLTYPE cast to an
     // int (because types can be negative) to the converter function.
@@ -104,7 +125,7 @@ struct Connection
  * exception is set and zero is returned.
  */
 PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, long timeout, bool fReadOnly,
-                         PyObject* attrs_before, PyObject* encoding);
+                         PyObject* attrs_before, PyObject* encoding, SQLUSMALLINT driver_completion);
 
 /*
  * Used by the Cursor to implement commit and rollback.

@@ -58,7 +58,11 @@ pyodbc.conf
 tmp
 tags
 xxx_*
+.DS_Store
 
 # The Access unit tests copy empty.accdb and empty.mdb to these names and use them.
 test.accdb
 test.mdb
+
+# Claude Code scratch space (throwaway repro scripts, experiments) — never committed
+/.claude/scratch/

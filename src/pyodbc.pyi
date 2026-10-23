@@ -1,9 +1,9 @@
 # ignore line spacing (E303), mixed case names (N802/N803)
 # ruff: noqa: E303, N802, N803
 from __future__ import annotations
-from collections.abc import Generator, Iterable, Iterator, Sequence
-from typing import Any, Callable, Final, Union
-
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
+from typing import Any, Final, Union
+import ctypes
 
 # SQLSetConnectAttr attributes
 # ref: https://docs.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetconnectattr-function
@@ -126,6 +126,22 @@ SQL_OJ_NESTED: int
 SQL_OJ_NOT_ORDERED: int
 SQL_OJ_INNER: int
 SQL_OJ_ALL_COMPARISON_OPS: int
+
+# SQL Server bulk copy (BCP): the connection attribute that enables it, and the host types
+# for Connection.bcp_bind_columns
+SQL_COPT_SS_BCP: int
+SQL_BCP_ON: int
+DB_IN: int
+SQLBIT: int
+SQLINT2: int
+SQLINT4: int
+SQLINT8: int
+SQLFLT4: int
+SQLFLT8: int
+SQLBINARY: int
+SQLUNIQUEID: int
+SQLCHARACTER: int
+SQLNCHAR: int
 
 # other ODBC database constants
 SQL_SCOPE_CURROW: int
@@ -294,6 +310,11 @@ SQL_UNION: int
 SQL_USER_NAME: int
 SQL_XOPEN_CLI_YEAR: int
 
+# driver connect completion modes
+SQL_DRIVER_COMPLETE: int
+SQL_DRIVER_COMPLETE_REQUIRED: int
+SQL_DRIVER_NOPROMPT: int
+SQL_DRIVER_PROMPT: int
 
 # pyodbc-specific constants
 BinaryNull: Any  # to distinguish binary NULL values from char NULL values
@@ -308,6 +329,7 @@ apilevel: Final[str] = '2.0'
 paramstyle: Final[str] = 'qmark'
 threadsafety: Final[int] = 1
 version: Final[str]  # not pep-0249
+henv: Final[ctypes.c_void_p]
 
 # read-write (not pep-0249)
 lowercase: bool = False
@@ -356,12 +378,49 @@ class Connection:
         ...
 
     @property
+    def fetch_decimal_as_string(self) -> bool:
+        """If True, DECIMAL and NUMERIC values will be fetched as strings using the
+        legacy local-aware path.  If False (the default), values are fetched using a
+        binary representation that is not affected by the locale."""
+        ...
+
+    @fetch_decimal_as_string.setter
+    def fetch_decimal_as_string(self, value: bool) -> None:
+        ...
+
+    @property
+    def hdbc(self) -> ctypes.c_void_p | None:
+        """ODBC handle for the connection."""
+        ...
+
+    @property
+    def compat_diagrec_byte_length(self) -> bool:
+        """Set to True if the driver incorrectly reports byte length instead of
+        character length for diagnostic messages.
+
+        See https://github.com/mkleehammer/pyodbc/issues/489."""
+        ...
+
+    @compat_diagrec_byte_length.setter
+    def compat_diagrec_byte_length(self, value: bool) -> None:
+        ...
+
+    @property
     def maxwrite(self) -> int:
         """The maximum bytes to write before using SQLPutData, default is zero for no maximum."""
         ...
 
     @maxwrite.setter
     def maxwrite(self, value: int) -> None:
+        ...
+
+    @property
+    def readvar_initsize(self) -> int:
+        """The initial buffer size in bytes for reading values from variable-length columns."""
+        ...
+
+    @readvar_initsize.setter
+    def readvar_initsize(self, value: int) -> None:
         ...
 
     @property
@@ -427,7 +486,7 @@ class Connection:
         """
         ...
 
-    def set_attr(self, attr_id: int, value: int, /) -> None:
+    def set_attr(self, attr_id: int, value: int | str, /) -> None:
         """Set an attribute on the connection, via SQLSetConnectAttr.
 
         Args:
@@ -511,6 +570,45 @@ class Connection:
         """Close the connection.  Any uncommitted SQL statements will be rolled back."""
         ...
 
+    def bcp_init(self, table: str, direction: int = ..., batch_rows: int = 0,
+                 keep_nulls: bool = False, hints: str | None = None, max_errors: int = 0) -> None:
+        """Open a SQL Server bulk copy (BCP) session loading rows into `table`.  The
+        connection must have been opened with
+        attrs_before={pyodbc.SQL_COPT_SS_BCP: pyodbc.SQL_BCP_ON}; connection pooling matches
+        on the connection string alone, so give BCP connections their own (e.g. a distinct
+        APP=).  direction must be pyodbc.DB_IN.  If batch_rows is positive, bcp_sendrow() ends
+        a batch every batch_rows rows.  keep_nulls stores None as NULL in columns with a
+        DEFAULT, and hints passes BCP hints such as 'TABLOCK' or
+        'CHECK_CONSTRAINTS,FIRE_TRIGGERS'.  In autocommit mode bcp_batch() and bcp_done()
+        commit; closing the connection first discards the rows sent since the last batch."""
+        ...
+
+    def bcp_bind_columns(self, types: Sequence[int]) -> Any:
+        """Bind one buffer per table column, in table order, for the open BCP session and
+        return the context for bcp_setrow().  Each type is one of pyodbc.SQLBIT, SQLINT2,
+        SQLINT4, SQLINT8, SQLFLT4, SQLFLT8, SQLNCHAR (str), SQLCHARACTER (bytes in the client
+        code page, or ASCII str), SQLBINARY or SQLUNIQUEID."""
+        ...
+
+    def bcp_setrow(self, ctx: Any, row: tuple[Any, ...] | list[Any]) -> None:
+        """Convert one row, with a value (or None) per bound column, into the bound buffers."""
+        ...
+
+    def bcp_sendrow(self) -> None:
+        """Send the row prepared by bcp_setrow(); each row needs its own bcp_setrow()."""
+        ...
+
+    def bcp_batch(self, ctx: Any = None) -> int:
+        """End the current batch, storing the rows sent since the last one, and return their
+        number."""
+        ...
+
+    def bcp_done(self) -> int:
+        """End the BCP session, storing the rows sent since the last batch, and return their
+        number.  In autocommit mode they are committed; in manual-commit mode they join the
+        open transaction."""
+        ...
+
 
 class Cursor:
     """The class representing database cursors.  Cursors are vehicles for executing SQL
@@ -565,6 +663,55 @@ class Cursor:
 
     @fast_executemany.setter
     def fast_executemany(self, value: bool) -> None:
+        ...
+
+    @property
+    def use_bcp_fast(self) -> bool:
+        """With fast_executemany, load SQL Server INSERTs with the bulk copy (BCP) API whenever
+        that stores the same data as the plain path; otherwise the plain path runs.  The
+        connection must be opened with attrs_before={pyodbc.SQL_COPT_SS_BCP:
+        pyodbc.SQL_BCP_ON}, or the plain path runs; connection pooling matches on the
+        connection string alone, so give BCP connections their own (e.g. a distinct APP=).  A
+        failed load is rolled back in full and raised, and after a load rowcount is the number
+        of rows copied."""
+        ...
+
+    @use_bcp_fast.setter
+    def use_bcp_fast(self, value: bool) -> None:
+        ...
+
+    @property
+    def bcp_batch_rows(self) -> int:
+        """Rows per BCP batch; 0 sends all rows as one batch.  In autocommit mode each
+        completed batch is committed, and a failure discards only the batch it occurred in."""
+        ...
+
+    @bcp_batch_rows.setter
+    def bcp_batch_rows(self, value: int) -> None:
+        ...
+
+    @property
+    def bcp_tablock(self) -> bool:
+        """Pass the TABLOCK hint when using BCP, which takes a bulk-update table lock and allows
+        minimal logging."""
+        ...
+
+    @bcp_tablock.setter
+    def bcp_tablock(self, value: bool) -> None:
+        ...
+
+    @property
+    def rows_as_dicts(self) -> bool:
+        """If True, rows are returned as dicts instead of Row objects."""
+        ...
+
+    @rows_as_dicts.setter
+    def rows_as_dicts(self, value: bool) -> None:
+        ...
+
+    @property
+    def hstmt(self) -> ctypes.c_void_p | None:
+        """ODBC handle for the statement."""
         ...
 
     @property
@@ -743,6 +890,23 @@ class Cursor:
 
         Returns:
             The cursor object, containing table information in the result set.
+        """
+        ...
+
+    def tablePrivileges(self,
+                        table: str | None = None,
+                        catalog: str | None = None,
+                        schema: str | None = None) -> Cursor:
+        """Return information about privileges granted for the tables in the
+        database.
+
+        Args:
+            table: Name of the database table.
+            catalog: Name of the catalog (database).
+            schema: Name of the table schema.
+
+        Returns:
+            The cursor object, containing table privilege info in the result set.
         """
         ...
 
@@ -945,9 +1109,12 @@ class Row:
 
 # module functions
 
-def dataSources() -> dict[str, str]:
+def dataSources(*, scope: str | None = None) -> dict[str, str]:
     """Return all available Data Source Names (DSNs), typically from the odbcinst.ini file
     or the Windows ODBC Data Source Administrator.
+
+    Args:
+        scope: optional filter ("user" or "system") to control which DSNs are returned.
 
     Returns:
         A dictionary of DSNs and their textual descriptions.
@@ -999,6 +1166,9 @@ def connect(connstring: str | None = None,
         readonly: To set the connection read-only.  Not all drivers and/or databases support this.
         timeout: Set the connection timeout, in seconds.  This is managed by the driver, not
             pyodbc, and not all drivers support this.
+        driver_completion: One of SQL_DRIVER_PROMPT (only available on Windows),
+            SQL_DRIVER_NO_PROMPT (the default), SQL_DRIVER_COMPLETE, or
+            SQL_DRIVER_COMPLETE_REQUIRED.
         attrs_before: Set low-level connection attributes before a connection is attempted.
         **kwargs: These key/value pairs are used to construct the connection string, or add
             to it (as "key=value;" combinations).

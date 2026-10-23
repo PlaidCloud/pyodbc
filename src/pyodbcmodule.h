@@ -40,6 +40,8 @@ PyObject* GetClassForThread(const char* szModule, const char* szClass);
 
 bool IsInstanceForThread(PyObject* param, const char* szModule, const char* szClass, PyObject** pcls);
 
+extern PyObject* MakeVoidPointerFromHandle(SQLHANDLE handle);
+
 extern PyObject* null_binary;
 
 extern HENV henv;

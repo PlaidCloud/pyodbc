@@ -109,7 +109,6 @@ bool SetDecimalPoint(PyObject* pNew)
     return true;
 }
 
-
 PyObject* DecimalFromText(const TextEnc& enc, const byte* pb, Py_ssize_t cb)
 {
     // Creates a Decimal object from a text buffer.
@@ -131,11 +130,53 @@ PyObject* DecimalFromText(const TextEnc& enc, const byte* pb, Py_ssize_t cb)
 
     if (pLocaleDecimalEscaped)
     {
-        Object c2(PyObject_CallFunctionObjArgs(re_sub, pLocaleDecimalEscaped, pDecimalPoint, 0));
+        Object c2(PyObject_CallFunctionObjArgs(re_sub, pLocaleDecimalEscaped, pDecimalPoint, cleaned.Get(), 0));
         if (!c2)
             return 0;
         cleaned.Attach(c2.Detach());
     }
 
     return PyObject_CallFunctionObjArgs(decimal, cleaned.Get(), 0);
+}
+
+PyObject* DecimalFromNumericStruct(const SQL_NUMERIC_STRUCT& num)
+{
+    // Avoid the problems introduced by locale-specific delimiters in numeric strings
+    // by having the driver provide the value using a well-defined binary structure.
+
+    // Convert the little-endian (1) unsigned (0) magnitude to a Python int.
+    PyObject* magnitude = _PyLong_FromByteArray(num.val, SQL_MAX_NUMERIC_LEN, 1, 0);
+    if (!magnitude)
+        return NULL;
+
+    // Convert magnitude to a tuple of decimal digits via str().
+    Object magStr(PyObject_Str(magnitude));
+    Py_DECREF(magnitude);
+    if (!magStr)
+        return NULL;
+
+    Py_ssize_t nDigits = PyUnicode_GET_LENGTH(magStr.Get());
+    Object digitTuple(PyTuple_New(nDigits));
+    if (!digitTuple)
+        return NULL;
+
+    for (Py_ssize_t i = 0; i < nDigits; i++)
+    {
+        Py_UCS4 ch = PyUnicode_READ_CHAR(magStr.Get(), i);
+        PyObject* digit = PyLong_FromLong((long)(ch - '0'));
+        if (!digit)
+            return NULL;
+        PyTuple_SET_ITEM(digitTuple.Get(), i, digit);
+    }
+
+    // Decimal sign: 0 = positive, 1 = negative (opposite of ODBC convention).
+    int decimalSign = (num.sign == 1) ? 0 : 1;
+    long exponent = -(long)num.scale;
+
+    // Decimal((sign, (d, d, ...), exponent))
+    Object args(Py_BuildValue("((iOl))", decimalSign, digitTuple.Get(), exponent));
+    if (!args)
+        return NULL;
+
+    return PyObject_CallObject(decimal, args.Get());
 }

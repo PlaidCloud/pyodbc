@@ -12,6 +12,7 @@
 // between both code paths.  I'll probably also rename the feature to something that describes
 // it more precisely like "array binding".
 
+#include <vector>
 #include "pyodbc.h"
 #include "wrapper.h"
 #include "textenc.h"
@@ -534,9 +535,15 @@ static void FreeInfos(ParamInfo* a, Py_ssize_t count)
     PyMem_Free(a);
 }
 
-static bool GetNullInfo(Cursor* cur, Py_ssize_t index, ParamInfo& info)
+static bool GetNullInfo(Cursor* cur, Py_ssize_t index, ParamInfo& info, bool isTVP)
 {
-    if (!GetParamType(cur, index, info.ParameterType))
+    // GetParamType won't work for TVP columns, so we fall back on SQL_VARCHAR.
+    if (isTVP)
+    {
+        if (info.ParameterType == SQL_UNKNOWN_TYPE)
+            info.ParameterType = SQL_VARCHAR;
+    }
+    else if (!GetParamType(cur, index, info.ParameterType))
         return false;
 
     info.ValueType     = SQL_C_DEFAULT;
@@ -1023,7 +1030,7 @@ bool GetParameterInfo(Cursor* cur, Py_ssize_t index, PyObject* param, ParamInfo&
     // Populates `info`.
 
     if (param == Py_None)
-        return GetNullInfo(cur, index, info);
+        return GetNullInfo(cur, index, info, isTVP);
 
     if (param == null_binary)
         return GetNullBinaryInfo(cur, index, info);
@@ -1157,6 +1164,270 @@ static bool UpdateParamInfo(Cursor* pCursor, Py_ssize_t nIndex, ParamInfo *pInfo
   return rc;
 }
 
+// Peek at a Decimal value to get binding needed information without serializing it to a string.
+static bool GetDecimalPrecisionAndScale(PyObject* value, SQLULEN& precision, SQLSMALLINT& scale)
+{
+    Object t(PyObject_CallMethod(value, "as_tuple", 0));
+    if (!t)
+        return false;
+    PyObject* digits = PyTuple_GET_ITEM(t.Get(), 1);
+    long exp = PyLong_AsLong(PyTuple_GET_ITEM(t.Get(), 2));
+    Py_ssize_t count = PyTuple_GET_SIZE(digits);
+    if (exp >= 0) {
+        precision = (SQLULEN)((SQLUINTEGER)count + exp);
+        scale = 0;
+    }
+    else if (-exp <= count) {
+        precision = (SQLULEN)count;
+        scale = (SQLSMALLINT)-exp;
+    }
+    else {
+        precision = (SQLULEN)(-exp);
+        scale = (SQLSMALLINT)precision;
+    }
+    return true;
+}
+
+// Helper for BindParameter, which was getting unwieldy enough already.
+static bool BindTVPColumns(Cursor* cur, Py_ssize_t index, ParamInfo& info)
+{
+    // Register the type name and schema for the TVP if provided (they'll be strings
+    // instead of sequences).
+    Py_ssize_t sequenceSize = PySequence_Size(info.pObject);
+    Py_ssize_t dataStart = 0;
+    if (sequenceSize > 0) {
+        PyObject *cell0 = PySequence_GetItem(info.pObject, 0);
+        Py_XDECREF(cell0);
+        if (PyBytes_Check(cell0) || PyUnicode_Check(cell0)) {
+            ++dataStart;
+            SQLHDESC desc;
+            PyObject *tvpname = PyCodec_Encode(cell0, "UTF-16LE", 0);
+            SQLGetStmtAttr(cur->hstmt, SQL_ATTR_IMP_PARAM_DESC, &desc, 0, 0);
+            SQLSetDescFieldW(desc, index + 1, SQL_CA_SS_TYPE_NAME,
+                (SQLPOINTER)PyBytes_AsString(tvpname), PyBytes_Size(tvpname));
+            Py_XDECREF(tvpname);
+
+            if (sequenceSize > 1) {
+                PyObject *cell1 = PySequence_GetItem(info.pObject, 1);
+                Py_XDECREF(cell1);
+                if (PyBytes_Check(cell1) || PyUnicode_Check(cell1)) {
+                    ++dataStart;
+                    PyObject *tvpschema = PyCodec_Encode(cell1, "UTF-16LE", 0);
+                    SQLSetDescFieldW(desc, index + 1, SQL_CA_SS_SCHEMA_NAME,
+                        (SQLPOINTER)PyBytes_AsString(tvpschema), PyBytes_Size(tvpschema));
+                    Py_XDECREF(tvpschema);
+                }
+            }
+        }
+    }
+
+    SQLHDESC desc;
+    SQLGetStmtAttr(cur->hstmt, SQL_ATTR_APP_PARAM_DESC, &desc, 0, 0);
+    SQLSetDescField(desc, index + 1, SQL_DESC_DATA_PTR, (SQLPOINTER)info.ParameterValuePtr, 0);
+
+    // Validate the table shape and determine the column count.
+    Py_ssize_t ncols = 0;
+    Py_ssize_t nrows = sequenceSize - dataStart;
+    for (Py_ssize_t r = 0; r < nrows; ++r) {
+        PyObject* row = PySequence_GetItem(info.pObject, r + dataStart);
+        Py_XDECREF(row);
+        if (!PySequence_Check(row)) {
+            PyErr_SetString(ProgrammingError, "A TVP's rows must be Sequence objects.");
+            return false;
+        }
+        if (ncols && ncols != PySequence_Size(row)) {
+            RaiseErrorV(0, ProgrammingError, "A TVP's rows must all be the same size.");
+            return false;
+        }
+        ncols = PySequence_Size(row);
+    }
+
+    // If the TVP is empty we're done.
+    if (!ncols) {
+        info.nested = 0;
+        info.StrLen_or_Ind = SQL_DEFAULT_PARAM;
+        return true;
+    }
+
+    // Store the binding informantion separately from the first row's ParamInfo array.
+    // It's not enough to store the maximum precision and the maximum scale separately.
+    // If a TVP column gets the Python values Decimal('1.2345') and Decimal('12.345')
+    // for a DECIMAL column, the maximum precision will be 5 and the maximum scale
+    // will be 4, but the second value will not fit in a SQL NUMERIC(5,4) column.
+    // Therefore we must instead keep track of the maximum number of digits on each
+    // side of the decimal point. We use DecimalDigits to remember the maximum number
+    // of digits to the right of the decimal point (which is basically what it's already
+    // doing) and we temporarily use ColumnSize to store the maximum number of digits
+    // to the left of the decimal point, which for each value is max(ColumnSize -
+    // DecimalDigits, 0). This calculation even works in the case where DecimalDigits
+    // is negative (the example given by the ODBC spec is "12000" which could be stored
+    // as "12" with a scale of -3). When we have finished scanning all the rows, we
+    // assign to DecimalDigits the value max(DecimalDigits, 0), and then we assign to
+    // ColumnSize the result of the calculation ColumnSize + DecimalDigits for each of
+    // the Decimal columns. This approach will ensure that all the values will fit for
+    // the bindings we apply for those columns (assuming they do not exceed limits
+    // imposed by the database). Note that we have to check ParameterType instead of
+    // ValueType, because as of this writing we're still giving DECIMAL values to the
+    // driver serialized as strings, so ValueType will be the unhelpful (for this
+    // purpose) SQL_C_CHAR. Note also that we don't need to pay any attention to the
+    // BufferLength value: the driver ignores it at bind time when StrLen_or_IndPtr is
+    // set to SQL_DATA_AT_EXEC, which it is for all of the TVP column parameters.
+    struct BindInfo {
+        SQLSMALLINT vtype;      // ValueType
+        SQLSMALLINT ptype;      // ParameterType
+        SQLULEN     colsize;    // ColumnSize
+        SQLULEN     idigits;    // digits to the left of the decimal point
+        SQLSMALLINT ddigits;    // digits to the right of the decimal point
+        bool        confirmed;  // if true, we have what we need to bind this column.
+    };
+
+    // Scan all rows to determine binding info for each column.
+    std::vector<BindInfo> bindinfo;
+    try {
+        bindinfo.resize(ncols);
+    }
+    catch (const std::bad_alloc&) {
+        PyErr_NoMemory();
+        return false;
+    }
+    info.maxlength = ncols;
+    info.nested = (ParamInfo*)PyMem_Calloc(sizeof(ParamInfo), ncols);
+    if (!info.nested) {
+        PyErr_NoMemory();
+        return false;
+    }
+    for (Py_ssize_t r = 0; r < nrows; r++) {
+
+        // Check the row's value for each parameter for which we still need information.
+        bool keep_scanning = false;
+        PyObject* row = PySequence_GetItem(info.pObject, dataStart + r);
+        Py_XDECREF(row);
+        for (Py_ssize_t i = 0; i < ncols; i++) {
+            if (bindinfo[i].confirmed)
+                continue;
+            keep_scanning = true;
+            PyObject* value = PySequence_GetItem(row, i);
+            Py_XDECREF(value);
+
+            // Populate the nested array from the first row in the nested vector.
+            if (r == 0) {
+
+                // Populate nested[i] directly for the first row, even for NULLs.
+                if (!GetParameterInfo(cur, i, value, info.nested[i], true))
+                    return false;
+                bindinfo[i].vtype = info.nested[i].ValueType;
+                bindinfo[i].ptype = info.nested[i].ParameterType;
+                bindinfo[i].colsize = info.nested[i].ColumnSize;
+                if (info.nested[i].ParameterType == SQL_NUMERIC) {
+                    bindinfo[i].idigits = max(bindinfo[i].colsize - info.nested[i].DecimalDigits, 0);
+                    bindinfo[i].ddigits = max(info.nested[i].DecimalDigits, 0);
+                }
+                else
+                    bindinfo[i].ddigits = info.nested[i].DecimalDigits;
+                info.nested[i].StrLen_or_Ind = SQL_DATA_AT_EXEC;
+            }
+
+            // If we reach this block we've only seen Py_None for this column so far (so we
+            // still need to find out what the column's actual type is), or the column's type
+            // is Decimal (so we need to make sure we bind the column with a precision and
+            // scale which can handle all the values in the TVP for the column).
+            else {
+                if (value == Py_None)
+                    continue;
+
+                if (info.nested[i].ParameterType == SQL_NUMERIC) {
+
+                    // Bump up digit counts if appropriate.
+                    SQLULEN precision;
+                    SQLSMALLINT scale;
+                    if (!GetDecimalPrecisionAndScale(value, precision, scale)) {
+                        RaiseErrorV(0, PyExc_TypeError, "Expected Decimal but got %s (TVP column %d)",
+                            Py_TYPE(value)->tp_name, i);
+                        return false;
+                    }
+                    SQLULEN integerDigits = max(precision - scale, 0);
+                    bindinfo[i].idigits = max(bindinfo[i].idigits, integerDigits);
+                    bindinfo[i].ddigits = max(bindinfo[i].ddigits, max(scale, 0));
+                }
+                else {
+
+                    // All we have so far are NULL values, so we're trying to discover the true type.
+                    ParamInfo tempinfo;
+                    memset(&tempinfo, 0, sizeof(tempinfo));
+                    if (!GetParameterInfo(cur, i, value, tempinfo, true))
+                        return false;
+
+                    // We're not going to use the actual value yet, so make sure memory gets cleaned up.
+                    Py_XDECREF(tempinfo.pObject);
+                    if (tempinfo.allocated)
+                        PyMem_Free(tempinfo.ParameterValuePtr);
+
+                    // Grab the type information.
+                    bindinfo[i].ptype = info.nested[i].ParameterType = tempinfo.ParameterType;
+                    bindinfo[i].vtype = tempinfo.ValueType;
+
+                    // If this is a numeric, we also want precision and scale.
+                    if (tempinfo.ParameterType == SQL_NUMERIC) {
+                        bindinfo[i].idigits = max(tempinfo.ColumnSize - tempinfo.DecimalDigits, 0);
+                        bindinfo[i].ddigits = max(tempinfo.DecimalDigits, 0);
+                    }
+                    else if (tempinfo.ParameterType == SQL_TIMESTAMP)
+                        bindinfo[i].ddigits = tempinfo.DecimalDigits;
+                    else
+                        // For any other type, we should have everything we need for binding this column.
+                        bindinfo[i].confirmed = true;
+                }
+            }
+        }
+
+        // If the "confirmed" flag was set for all columns when we scanned this row, we don't need to
+        // look at any more rows.
+        if (!keep_scanning)
+            break;
+    }
+
+    // Fix the DECIMAL ColumnSize values (see lengthy comment above).
+    for (Py_ssize_t i = 0; i < ncols; i++) {
+        if (bindinfo[i].ptype == SQL_NUMERIC) {
+            bindinfo[i].colsize = bindinfo[i].idigits + bindinfo[i].ddigits;
+        }
+        else
+            bindinfo[i].colsize = 0;
+    }
+
+    // We're finally ready to Bind each column.
+    SQLRETURN ret = SQLSetStmtAttr(cur->hstmt, SQL_SOPT_SS_PARAM_FOCUS, (SQLPOINTER)(index + 1),
+        SQL_IS_INTEGER);
+    if (!SQL_SUCCEEDED(ret)) {
+        RaiseErrorFromHandle(cur->cnxn, "SQLSetStmtAttr", GetConnection(cur)->hdbc, cur->hstmt);
+        return false;
+    }
+    for (Py_ssize_t i = 0; i < ncols; i++) {
+        Py_BEGIN_ALLOW_THREADS
+        ret = SQLBindParameter(cur->hstmt, (SQLUSMALLINT)(i + 1), SQL_PARAM_INPUT,
+            bindinfo[i].vtype, bindinfo[i].ptype, bindinfo[i].colsize, bindinfo[i].ddigits,
+            info.nested + i, 0, &info.nested[i].StrLen_or_Ind);
+        Py_END_ALLOW_THREADS;
+        if (GetConnection(cur)->hdbc == SQL_NULL_HANDLE) {
+            RaiseErrorV(0, ProgrammingError, "The cursor's connection was closed.");
+            return false;
+        }
+        if (!SQL_SUCCEEDED(ret)) {
+            RaiseErrorFromHandle(cur->cnxn, "SQLBindParameter", GetConnection(cur)->hdbc, cur->hstmt);
+            return false;
+        }
+    }
+
+    // Restore the context back to the statement's parameters.
+    ret = SQLSetStmtAttr(cur->hstmt, SQL_SOPT_SS_PARAM_FOCUS, 0, SQL_IS_INTEGER);
+    if (!SQL_SUCCEEDED(ret)) {
+        RaiseErrorFromHandle(cur->cnxn, "SQLSetStmtAttr", GetConnection(cur)->hdbc, cur->hstmt);
+        return false;
+    }
+
+    return true;
+}
+
 bool BindParameter(Cursor* cur, Py_ssize_t index, ParamInfo& info)
 {
     SQLSMALLINT sqltype = info.ParameterType;
@@ -1194,124 +1465,9 @@ bool BindParameter(Cursor* cur, Py_ssize_t index, ParamInfo& info)
         return false;
     }
 
-    // This is a TVP. Enter and bind its parameters, allocate descriptors for its columns (all as DAE)
-    if (sqltype == SQL_SS_TABLE)
-    {
-        Py_ssize_t nrows = PySequence_Size(info.pObject);
-        if (nrows > 0)
-        {
-            PyObject *cell0 = PySequence_GetItem(info.pObject, 0);
-            Py_XDECREF(cell0);
-            if (PyBytes_Check(cell0) || PyUnicode_Check(cell0))
-            {
-                SQLHDESC desc;
-                PyObject *tvpname = PyCodec_Encode(cell0, "UTF-16LE", 0);
-                SQLGetStmtAttr(cur->hstmt, SQL_ATTR_IMP_PARAM_DESC, &desc, 0, 0);
-                SQLSetDescFieldW(desc, index + 1, SQL_CA_SS_TYPE_NAME, (SQLPOINTER)PyBytes_AsString(tvpname), PyBytes_Size(tvpname));
-                Py_XDECREF(tvpname);
-
-                if (nrows > 1)
-                {
-                    PyObject *cell1 = PySequence_GetItem(info.pObject, 1);
-                    Py_XDECREF(cell1);
-                    if (PyBytes_Check(cell1) || PyUnicode_Check(cell1))
-                    {
-                        PyObject *tvpschema = PyCodec_Encode(cell1, "UTF-16LE", 0);
-                        SQLSetDescFieldW(desc, index + 1, SQL_CA_SS_SCHEMA_NAME, (SQLPOINTER)PyBytes_AsString(tvpschema), PyBytes_Size(tvpschema));
-                        Py_XDECREF(tvpschema);
-                    }
-                }
-            }
-        }
-
-        SQLHDESC desc;
-        SQLGetStmtAttr(cur->hstmt, SQL_ATTR_APP_PARAM_DESC, &desc, 0, 0);
-        SQLSetDescField(desc, index + 1, SQL_DESC_DATA_PTR, (SQLPOINTER)info.ParameterValuePtr, 0);
-
-        int err = 0;
-        ret = SQLSetStmtAttr(cur->hstmt, SQL_SOPT_SS_PARAM_FOCUS, (SQLPOINTER)(index + 1), SQL_IS_INTEGER);
-        if (!SQL_SUCCEEDED(ret))
-        {
-            RaiseErrorFromHandle(cur->cnxn, "SQLSetStmtAttr", GetConnection(cur)->hdbc, cur->hstmt);
-            return false;
-        }
-
-        Py_ssize_t i = PySequence_Size(info.pObject) - info.ColumnSize;
-        Py_ssize_t ncols = 0;
-        while (i >= 0 && i < PySequence_Size(info.pObject))
-        {
-            PyObject *row = PySequence_GetItem(info.pObject, i);
-            Py_XDECREF(row);
-            if (!PySequence_Check(row))
-            {
-                RaiseErrorV(0, ProgrammingError, "A TVP's rows must be Sequence objects.");
-                err = 1;
-                break;
-            }
-            if (ncols && ncols != PySequence_Size(row))
-            {
-                RaiseErrorV(0, ProgrammingError, "A TVP's rows must all be the same size.");
-                err = 1;
-                break;
-            }
-            ncols = PySequence_Size(row);
-            i++;
-        }
-        if (!ncols)
-        {
-            // TVP has no columns --- is null
-            info.nested = 0;
-            info.StrLen_or_Ind = SQL_DEFAULT_PARAM;
-        }
-        else
-        {
-            PyObject *row = PySequence_GetItem(info.pObject, PySequence_Size(info.pObject) - info.ColumnSize);
-            Py_XDECREF(row);
-
-            info.nested = (ParamInfo*)PyMem_Malloc(ncols * sizeof(ParamInfo));
-            info.maxlength = ncols;
-            memset(info.nested, 0, ncols * sizeof(ParamInfo));
-
-            for(i=0;i<ncols;i++)
-            {
-                // Bind the TVP's columns --- all need to use DAE
-                PyObject *param = PySequence_GetItem(row, i);
-                Py_XDECREF(param);
-                GetParameterInfo(cur, i, param, info.nested[i], true);
-                info.nested[i].BufferLength = info.nested[i].StrLen_or_Ind;
-                info.nested[i].StrLen_or_Ind = SQL_DATA_AT_EXEC;
-
-                Py_BEGIN_ALLOW_THREADS
-                ret = SQLBindParameter(cur->hstmt, (SQLUSMALLINT)(i + 1), SQL_PARAM_INPUT,
-                    info.nested[i].ValueType, info.nested[i].ParameterType,
-                    info.nested[i].ColumnSize, info.nested[i].DecimalDigits,
-                    info.nested + i, info.nested[i].BufferLength, &info.nested[i].StrLen_or_Ind);
-                Py_END_ALLOW_THREADS;
-                if (GetConnection(cur)->hdbc == SQL_NULL_HANDLE)
-                {
-                    // The connection was closed by another thread in the ALLOW_THREADS block above.
-                    RaiseErrorV(0, ProgrammingError, "The cursor's connection was closed.");
-                    return false;
-                }
-
-                if (!SQL_SUCCEEDED(ret))
-                {
-                    RaiseErrorFromHandle(cur->cnxn, "SQLBindParameter", GetConnection(cur)->hdbc, cur->hstmt);
-                    return false;
-                }
-            }
-        }
-
-        ret = SQLSetStmtAttr(cur->hstmt, SQL_SOPT_SS_PARAM_FOCUS, 0, SQL_IS_INTEGER);
-        if (!SQL_SUCCEEDED(ret))
-        {
-            RaiseErrorFromHandle(cur->cnxn, "SQLSetStmtAttr", GetConnection(cur)->hdbc, cur->hstmt);
-            return false;
-        }
-
-        if (err)
-            return false;
-    }
+    // If this is a TVP, bind its parameters, allocate descriptors for its columns (all as DAE)
+    if (sqltype == SQL_SS_TABLE && !BindTVPColumns(cur, index, info))
+        return false;
 
     return true;
 }

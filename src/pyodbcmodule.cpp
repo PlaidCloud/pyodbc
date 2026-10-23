@@ -21,6 +21,7 @@
 #include "params.h"
 #include "dbspecific.h"
 #include "decimal.h"
+#include "bcp_support.h"
 #include <datetime.h>
 
 #include <time.h>
@@ -85,6 +86,28 @@ PyObject* ProgrammingError;
 PyObject* IntegrityError;
 PyObject* DataError;
 PyObject* NotSupportedError;
+
+// Used for henv, hdbc, and hstmt properties.
+PyObject* MakeVoidPointerFromHandle(SQLHANDLE handle)
+{
+    if (handle == SQL_NULL_HANDLE)
+        Py_RETURN_NONE;
+    static PyObject* c_void_p;
+    if (!c_void_p)
+    {
+        PyObject* ctypes = PyImport_ImportModule("ctypes");
+        if (!ctypes)
+            return nullptr;
+        c_void_p = PyObject_GetAttrString(ctypes, "c_void_p");
+        if (!c_void_p)
+        {
+            Py_DECREF(ctypes);
+            return nullptr;
+        }
+        Py_DECREF(ctypes);
+    }
+    return PyObject_CallFunction(c_void_p, "K", (unsigned long long)(uintptr_t)handle);
+}
 
 struct ExcInfo
 {
@@ -274,6 +297,7 @@ static bool import_types()
     GetData_init();
     if (!Params_init())
         return false;
+    BcpExecuteMany_init();
     if (!InitializeDecimal())
         return false;
 
@@ -311,7 +335,7 @@ static bool AllocateEnv()
         }
     }
     Py_DECREF(odbcversion);
-    
+
     if (!SQL_SUCCEEDED(SQLSetEnvAttr(henv, SQL_ATTR_ODBC_VERSION, defaultVersion, sizeof(int))))
     {
         PyErr_SetString(PyExc_RuntimeError, "Unable to set SQL_ATTR_ODBC_VERSION attribute.");
@@ -400,6 +424,7 @@ static PyObject* mod_connect(PyObject* self, PyObject* args, PyObject* kwargs)
     int fReadOnly = 0;
     long timeout = 0;
     PyObject* encoding = 0;
+    SQLUSMALLINT driver_completion = SQL_DRIVER_NOPROMPT;
 
     Object attrs_before; // Optional connect attrs set before connecting
 
@@ -475,6 +500,31 @@ static PyObject* mod_connect(PyObject* self, PyObject* args, PyObject* kwargs)
                 encoding = value;
                 continue;
             }
+            if (PyUnicode_CompareWithASCIIString(key, "driver_completion") == 0)
+            {
+                driver_completion = (SQLUSMALLINT)PyLong_AsLong(value);
+                if (PyErr_Occurred())
+                    return 0;
+                switch (driver_completion)
+                {
+                case SQL_DRIVER_PROMPT:
+                case SQL_DRIVER_COMPLETE:
+                case SQL_DRIVER_COMPLETE_REQUIRED:
+                case SQL_DRIVER_NOPROMPT:
+                    break;
+                default:
+                    PyErr_SetString(ProgrammingError, "Invalid value for driver_completion");
+                    return 0;
+                }
+#ifndef _WIN32
+                if (driver_completion == SQL_DRIVER_PROMPT)
+                {
+                    PyErr_SetString(NotSupportedError, "SQL_DRIVER_PROMPT not supported on this platform");
+                    return 0;
+                }
+#endif
+                continue;
+            }
 
             // Map DB API recommended names to ODBC names (e.g. user --> uid).
 
@@ -521,7 +571,8 @@ static PyObject* mod_connect(PyObject* self, PyObject* args, PyObject* kwargs)
     }
 
     return (PyObject*)Connection_New(pConnectString.Get(), fAutoCommit != 0, timeout,
-                                     fReadOnly != 0, attrs_before.Detach(), encoding);
+                                     fReadOnly != 0, attrs_before.Detach(), encoding,
+                                     driver_completion);
 }
 
 
@@ -574,9 +625,29 @@ static PyObject* mod_drivers(PyObject* self)
 }
 
 
-static PyObject* mod_datasources(PyObject* self)
+static PyObject* mod_datasources(PyObject* self, PyObject* args, PyObject* kwargs)
 {
     UNUSED(self);
+
+    static char* kwlist[] = { "scope", NULL };
+    const char* scope = NULL;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|$s", kwlist, &scope))
+        return 0;
+
+    SQLUSMALLINT nDirectionFirst;
+
+    if (scope == NULL)
+        nDirectionFirst = SQL_FETCH_FIRST;
+    else if (strcmp(scope, "user") == 0)
+        nDirectionFirst = SQL_FETCH_FIRST_USER;
+    else if (strcmp(scope, "system") == 0)
+        nDirectionFirst = SQL_FETCH_FIRST_SYSTEM;
+    else
+    {
+        PyErr_SetString(PyExc_ValueError, "scope must be 'user' or 'system'");
+        return 0;
+    }
 
     if (henv == SQL_NULL_HANDLE && !AllocateEnv())
         return 0;
@@ -597,7 +668,7 @@ static PyObject* mod_datasources(PyObject* self)
     SWORD cbDSN;
     SWORD cbDesc;
 
-    SQLUSMALLINT nDirection = SQL_FETCH_FIRST;
+    SQLUSMALLINT nDirection = nDirectionFirst;
 
     SQLRETURN ret;
 
@@ -695,6 +766,22 @@ static PyObject* mod_getdecimalsep(PyObject* self)
     return GetDecimalPoint();
 }
 
+static PyObject* mod_getattr(PyObject* self, PyObject* arg) {
+    const char* name = PyUnicode_AsUTF8(arg);
+    if (!name)
+        return nullptr;
+    if (strcmp(name, "henv") == 0) {
+        if (henv == SQL_NULL_HANDLE)
+        {
+            if (!AllocateEnv())
+                return nullptr;
+        }
+        return MakeVoidPointerFromHandle(henv);
+    }
+    PyErr_Format(PyExc_AttributeError, "module 'pyodbc' has no attribute '%s'", name);
+    return nullptr;
+}
+
 static char connect_doc[] =
     "connect(str, autocommit=False, timeout=0, **kwargs) --> Connection\n"
     "\n"
@@ -739,7 +826,11 @@ static char connect_doc[] =
     "  timeout\n"
     "    An integer login timeout in seconds, used to set the SQL_ATTR_LOGIN_TIMEOUT\n"
     "    attribute of the connection.  The default is 0 which means the database's\n"
-    "    default timeout, if any, is used.\n";
+    "    default timeout, if any, is used.\n"
+    "\n"
+    "  driver_completion\n"
+    "    One of SQL_DRIVER_PROMPT (only available on Windows), SQL_DRIVER_NO_PROMPT\n"
+    "    (the default), SQL_DRIVER_COMPLETE, or SQL_DRIVER_COMPLETE_REQUIRED.\n";
 
 static char timefromticks_doc[] =
     "TimeFromTicks(ticks) --> datetime.time\n"
@@ -768,9 +859,15 @@ static char drivers_doc[] =
     "Returns a list of installed drivers.";
 
 static char datasources_doc[] =
-    "dataSources() --> { DSN : Description }\n" \
+    "dataSources(*, scope=None) --> { DSN : Description }\n" \
     "\n" \
-    "Returns a dictionary mapping available DSNs to their descriptions.";
+    "Returns a dictionary mapping available DSNs to their descriptions.\n" \
+    "\n" \
+    "scope\n" \
+    "  An optional keyword-only argument to filter the returned DSNs.\n" \
+    "  If set to 'user', only user DSNs are returned.\n" \
+    "  If set to 'system', only system DSNs are returned.\n" \
+    "  If not set, all DSNs are returned.";
 
 static char setdecimalsep_doc[] =
     "setDecimalSeparator(string) -> None\n" \
@@ -792,7 +889,8 @@ static PyMethodDef pyodbc_methods[] =
     { "getDecimalSeparator", (PyCFunction)mod_getdecimalsep,      METH_NOARGS,               getdecimalsep_doc },
     { "TimestampFromTicks", (PyCFunction)mod_timestampfromticks, METH_VARARGS,               timestampfromticks_doc },
     { "drivers",            (PyCFunction)mod_drivers,            METH_NOARGS,                drivers_doc },
-    { "dataSources",        (PyCFunction)mod_datasources,        METH_NOARGS,                datasources_doc },
+    { "dataSources",        (PyCFunction)mod_datasources,        METH_VARARGS|METH_KEYWORDS, datasources_doc },
+    { "__getattr__",        (PyCFunction)mod_getattr,            METH_O,                     nullptr },
     { 0, 0, 0, 0 }
 };
 
@@ -1065,6 +1163,12 @@ static const ConstantDef aConstants[] = {
     MAKECONST(SQL_PACKET_SIZE),
     MAKECONST(SQL_ATTR_ANSI_APP),
 
+    // Driver connection completion modes
+    MAKECONST(SQL_DRIVER_COMPLETE),
+    MAKECONST(SQL_DRIVER_COMPLETE_REQUIRED),
+    MAKECONST(SQL_DRIVER_NOPROMPT),
+    MAKECONST(SQL_DRIVER_PROMPT),
+
     // SQL_CONVERT_X
     MAKECONST(SQL_CONVERT_FUNCTIONS),
     MAKECONST(SQL_CONVERT_BIGINT),
@@ -1108,6 +1212,21 @@ static const ConstantDef aConstants[] = {
     MAKECONST(SQL_OJ_NOT_ORDERED),
     MAKECONST(SQL_OJ_INNER),
     MAKECONST(SQL_OJ_ALL_COMPARISON_OPS),
+
+    // SQL Server bulk copy (BCP)
+    MAKECONST(SQL_COPT_SS_BCP),
+    MAKECONST(SQL_BCP_ON),
+    MAKECONST(DB_IN),
+    MAKECONST(SQLBIT),
+    MAKECONST(SQLINT2),
+    MAKECONST(SQLINT4),
+    MAKECONST(SQLINT8),
+    MAKECONST(SQLFLT4),
+    MAKECONST(SQLFLT8),
+    MAKECONST(SQLBINARY),
+    MAKECONST(SQLUNIQUEID),
+    MAKECONST(SQLCHARACTER),
+    MAKECONST(SQLNCHAR),
 };
 
 
@@ -1176,7 +1295,7 @@ PyMODINIT_FUNC PyInit_pyodbc()
     if (!module || !import_types() || !CreateExceptions())
         return 0;
 
-    const char* szVersion = TOSTRING(PYODBC_VERSION);
+    const char* szVersion = Py_STRINGIFY(PYODBC_VERSION);
     PyModule_AddStringConstant(module, "version", (char*)szVersion);
 
     PyModule_AddIntConstant(module, "threadsafety", 1);

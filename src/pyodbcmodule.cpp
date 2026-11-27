@@ -21,6 +21,7 @@
 #include "params.h"
 #include "dbspecific.h"
 #include "decimal.h"
+#include "bcp_support.h"
 #include <datetime.h>
 
 #include <time.h>
@@ -170,13 +171,32 @@ bool PyMem_Realloc(BYTE** pp, size_t newlen)
 
 
 
+static int GetModuleFlag(const char* name, bool identity)
+{
+    // Returns 1 if the module attribute `name` is set, 0 if it is not, and -1 (with no
+    // exception) if it has been deleted or cannot be tested.  If `identity` is true, only True
+    // counts as set.
+    PyObject* o = PyObject_GetAttrString(pModule, name);
+    if (!o)
+    {
+        PyErr_Clear();
+        return -1;
+    }
+    int r = identity ? (o == Py_True) : PyObject_IsTrue(o);
+    Py_DECREF(o);
+    if (r < 0)
+        PyErr_Clear();
+    return r;
+}
+
 bool UseNativeUUID()
 {
-    PyObject* o = PyObject_GetAttrString(pModule, "native_uuid");
-    // If this fails for some reason, we'll assume false and allow the exception to pop up later.
-    bool b = o && PyObject_IsTrue(o);
-    Py_XDECREF(o);
-    return b;
+    return GetModuleFlag("native_uuid", false) == 1;
+}
+
+bool lowercase()
+{
+    return GetModuleFlag("lowercase", true) == 1;
 }
 
 HENV henv = SQL_NULL_HANDLE;
@@ -280,9 +300,6 @@ static bool import_types()
     // Note: We can only import types from C extensions since they are shared among all
     // interpreters.  Other classes are imported per-thread via GetClassForThread.
 
-    // In Python 2.5 final, PyDateTime_IMPORT no longer works unless the datetime module was previously
-    // imported (among other problems).
-
     PyObject* pdt = PyImport_ImportModule("datetime");
 
     if (!pdt)
@@ -296,6 +313,7 @@ static bool import_types()
     GetData_init();
     if (!Params_init())
         return false;
+    BcpExecuteMany_init();
     if (!InitializeDecimal())
         return false;
 
@@ -305,9 +323,8 @@ static bool import_types()
 
 static bool AllocateEnv()
 {
-    PyObject* pooling = PyObject_GetAttrString(pModule, "pooling");
-    bool bPooling = pooling == Py_True;
-    Py_DECREF(pooling);
+    // pooling defaults to True if it has been deleted.
+    bool bPooling = GetModuleFlag("pooling", true) != 0;
 
     if (bPooling)
     {
@@ -326,13 +343,11 @@ static bool AllocateEnv()
 
     SQLPOINTER defaultVersion = (SQLPOINTER)SQL_OV_ODBC3;
     PyObject* odbcversion = PyObject_GetAttrString(pModule, "odbcversion");
-    if (PyObject_TypeCheck(odbcversion, &PyUnicode_Type)) {
-        if (PyUnicode_CompareWithASCIIString(odbcversion, "3.8") == 0)
-        {
-            defaultVersion = (SQLPOINTER)SQL_OV_ODBC3_80;
-        }
-    }
-    Py_DECREF(odbcversion);
+    if (!odbcversion)
+        PyErr_Clear();
+    else if (PyUnicode_Check(odbcversion) && PyUnicode_CompareWithASCIIString(odbcversion, "3.8") == 0)
+        defaultVersion = (SQLPOINTER)SQL_OV_ODBC3_80;
+    Py_XDECREF(odbcversion);
 
     if (!SQL_SUCCEEDED(SQLSetEnvAttr(henv, SQL_ATTR_ODBC_VERSION, defaultVersion, sizeof(int))))
     {
@@ -354,10 +369,12 @@ static bool CheckAttrsVal(PyObject *val, bool allowSeq)
     if (allowSeq && PySequence_Check(val))
     {
         Py_ssize_t len = PySequence_Size(val);
+        if (len < 0)
+            return false;
         for (Py_ssize_t i = 0; i < len; i++)
         {
             Object v(PySequence_GetItem(val, i));
-            if (!CheckAttrsVal(v, false))
+            if (!v || !CheckAttrsVal(v, false))
                 return false;
         }
         return true;
@@ -402,7 +419,7 @@ struct keywordmap
 {
     const char* oldname;
     const char* newname;
-    PyObject* newnameObject;    // PyString object version of newname, created as needed.
+    PyObject* newnameObject;    // str version of newname, created as needed.
 };
 
 static keywordmap keywordmaps[] =
@@ -436,8 +453,8 @@ static PyObject* mod_connect(PyObject* self, PyObject* args, PyObject* kwargs)
 
     if (size == 1)
     {
-        if (!PyUnicode_Check(PyTuple_GET_ITEM(args, 0)) && !PyUnicode_Check(PyTuple_GET_ITEM(args, 0)))
-            return PyErr_Format(PyExc_TypeError, "argument 1 must be a string or unicode object");
+        if (!PyUnicode_Check(PyTuple_GET_ITEM(args, 0)))
+            return PyErr_Format(PyExc_TypeError, "argument 1 must be a str");
 
         pConnectString.Attach(PyUnicode_FromObject(PyTuple_GetItem(args, 0)));
         if (!pConnectString.IsValid())
@@ -681,9 +698,12 @@ static PyObject* mod_datasources(PyObject* self, PyObject* args, PyObject* kwarg
         if (!SQL_SUCCEEDED(ret))
             break;
 
+        // On truncation the lengths are the full lengths, not what fit in the buffers.
+        SQLSMALLINT cchDSN  = min(cbDSN,  (SQLSMALLINT)(_countof(szDSN) - 1));
+        SQLSMALLINT cchDesc = min(cbDesc, (SQLSMALLINT)(_countof(szDesc) - 1));
         int byteorder = BYTEORDER_NATIVE;
-        PyObject* key = PyUnicode_DecodeUTF16((char*)szDSN, cbDSN * sizeof(wchar_t), "strict", &byteorder);
-        PyObject* val = PyUnicode_DecodeUTF16((char*)szDesc, cbDesc * sizeof(wchar_t), "strict", &byteorder);
+        PyObject* key = PyUnicode_DecodeUTF16((char*)szDSN, cchDSN * sizeof(wchar_t), "strict", &byteorder);
+        PyObject* val = PyUnicode_DecodeUTF16((char*)szDesc, cchDesc * sizeof(wchar_t), "strict", &byteorder);
 #else
         // UTF-8
         ret = SQLDataSources(henv, nDirection, szDSN,  _countof(szDSN),  &cbDSN, szDesc, _countof(szDesc), &cbDesc);
@@ -731,8 +751,14 @@ static PyObject* mod_timefromticks(PyObject* self, PyObject* args)
     if (!l)
         return 0;
 
-    time_t t = PyLong_AsLong(num);
-    struct tm* fields = localtime(&t);
+    long long ticks = PyLong_AsLongLong(l);
+    if (ticks == -1 && PyErr_Occurred())
+        return 0;
+
+    time_t t = (time_t)ticks;
+    struct tm* fields = ((long long)t == ticks) ? localtime(&t) : 0;
+    if (!fields)
+        return PyErr_Format(PyExc_OverflowError, "timestamp %lld out of range for localtime()", ticks);
 
     return PyTime_FromTime(fields->tm_hour, fields->tm_min, fields->tm_sec, 0);
 }
@@ -1217,6 +1243,21 @@ static const ConstantDef aConstants[] = {
     MAKECONST(SQL_OJ_NOT_ORDERED),
     MAKECONST(SQL_OJ_INNER),
     MAKECONST(SQL_OJ_ALL_COMPARISON_OPS),
+
+    // SQL Server bulk copy (BCP)
+    MAKECONST(SQL_COPT_SS_BCP),
+    MAKECONST(SQL_BCP_ON),
+    MAKECONST(DB_IN),
+    MAKECONST(SQLBIT),
+    MAKECONST(SQLINT2),
+    MAKECONST(SQLINT4),
+    MAKECONST(SQLINT8),
+    MAKECONST(SQLFLT4),
+    MAKECONST(SQLFLT8),
+    MAKECONST(SQLBINARY),
+    MAKECONST(SQLUNIQUEID),
+    MAKECONST(SQLCHARACTER),
+    MAKECONST(SQLNCHAR),
 };
 
 

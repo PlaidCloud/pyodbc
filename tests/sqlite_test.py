@@ -22,8 +22,10 @@ import pathlib
 import pickle
 import platform
 import re
+import subprocess
+import sys
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, time
 
 import pyodbc
 import pytest
@@ -104,6 +106,15 @@ def test_different_bindings(cursor: pyodbc.Cursor):
     cursor.execute("insert into t2 values (?)", datetime.now())  # noqa: DTZ005
 
 
+def test_fast_executemany_negative_scale(cursor: pyodbc.Cursor):
+    "A negative decimal scale must not be used to index the scaling table"
+    cursor.execute("create table t1(n numeric(18, 0))")
+    cursor.fast_executemany = True
+    cursor.setinputsizes([(pyodbc.SQL_DECIMAL, 18, -1)])
+    with pytest.raises(pyodbc.ProgrammingError, match="Numeric overflow"):
+        cursor.executemany("insert into t1 values (?)", [(123,)])
+
+
 def test_drivers():
     p = pyodbc.drivers()
     assert isinstance(p, list)
@@ -112,6 +123,61 @@ def test_drivers():
 def test_datasources():
     p = pyodbc.dataSources()
     assert isinstance(p, dict)
+
+
+def test_connect_bad_encoding(connection_string: str):
+    "An encoding name that can't be encoded raises instead of crashing"
+    with pytest.raises(UnicodeEncodeError):
+        pyodbc.connect(connection_string, encoding="\udcff",
+                       attrs_before={pyodbc.SQL_ATTR_CURRENT_CATALOG: "x"})
+
+
+def test_attrs_before_sequence_error(connection_string: str):
+    "An error reading an attrs_before sequence value propagates"
+    class BadSequence:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, i):
+            raise ValueError("no items")
+
+    with pytest.raises(ValueError, match="no items"):
+        pyodbc.connect(connection_string,
+                       attrs_before={pyodbc.SQL_ATTR_CURRENT_CATALOG: BadSequence()})
+
+
+@pytest.mark.parametrize('key', [2**31, -2**31 - 1, 2**40 + 102, 2**64])
+def test_attrs_before_key_out_of_range(connection_string: str, key):
+    "attrs_before keys that don't fit a SQLINTEGER raise instead of being truncated"
+    # 2**40 + 102 was truncated to 102, SQL_ATTR_AUTOCOMMIT.
+    with pytest.raises(OverflowError):
+        pyodbc.connect(connection_string, attrs_before={key: 1})
+
+
+def test_set_attr_errors(cnxn: pyodbc.Connection):
+    "set_attr raises for values it can't pass and for a closed connection"
+    with pytest.raises(UnicodeEncodeError):
+        cnxn.set_attr(pyodbc.SQL_ATTR_CURRENT_CATALOG, "\ud800")
+    with pytest.raises(OverflowError):
+        cnxn.set_attr(pyodbc.SQL_ATTR_CURRENT_CATALOG, 2**100)
+    cnxn.close()
+    with pytest.raises(pyodbc.ProgrammingError, match="closed connection"):
+        cnxn.set_attr(pyodbc.SQL_ATTR_CURRENT_CATALOG, "x")
+
+
+def test_searchescape_closed(cnxn: pyodbc.Connection):
+    cnxn.close()
+    with pytest.raises(pyodbc.ProgrammingError, match="closed connection"):
+        cnxn.searchescape
+
+
+def test_timefromticks():
+    "TimeFromTicks accepts floats and rejects timestamps localtime() can't represent"
+    assert isinstance(pyodbc.TimeFromTicks(1.5), time)
+    with pytest.raises(OverflowError):
+        pyodbc.TimeFromTicks(2**62)
+    with pytest.raises(OverflowError):
+        pyodbc.TimeFromTicks(2**100)
 
 
 def test_getinfo_string(cnxn: pyodbc.Connection):
@@ -654,6 +720,36 @@ def test_row_gtlt(cursor: pyodbc.Cursor):
     rows.sort()  # uses <
 
 
+def test_row_delete_column(cursor: pyodbc.Cursor):
+    "Deleting a Row column raises instead of crashing"
+    row = cursor.execute("select 1 as a").fetchone()
+    with pytest.raises(TypeError):
+        del row[0]
+    with pytest.raises(TypeError):
+        del row.a
+    assert row.a == 1
+
+
+def test_row_bad_name_map():
+    "A Row whose column map points outside the row raises instead of reading past it"
+    for index in (100000, -5):
+        row = pyodbc.Row(("x",), {"a": index}, 1)
+        with pytest.raises(IndexError):
+            row.a
+
+
+def test_row_compare_error():
+    "An exception from comparing two values propagates out of the Row comparison"
+    class Uncomparable:
+        def __eq__(self, other):
+            raise ValueError("no comparing")
+
+    row1 = pyodbc.Row(("a",), {"a": 0}, Uncomparable())
+    row2 = pyodbc.Row(("a",), {"a": 0}, Uncomparable())
+    with pytest.raises(ValueError, match="no comparing"):
+        row1 == row2  # noqa: B015
+
+
 def _test_context_manager(connection_string):
     # TODO: This is failing, but it may be due to the design of sqlite.  I've disabled it
     # for now until I can research it some more.
@@ -799,3 +895,156 @@ def test_rows_as_dicts(cursor: pyodbc.Cursor):
     row = cursor.execute("select name, name from t1").fetchone()
     assert len(row) == 1
     assert row == {"name": "Kathleen"}
+
+
+def test_rows_as_dicts_fetchval(cursor: pyodbc.Cursor):
+    "fetchval returns the first column even when rows are dicts"
+    cursor.rows_as_dicts = True
+    assert cursor.execute("select 42 as a, 1 as b").fetchval() == 42
+
+
+@pytest.mark.parametrize("method, args", [
+    ("tables", ()), ("tablePrivileges", ()), ("columns", ()), ("statistics", ("t1",)),
+    ("rowIdColumns", ("t1",)), ("rowVerColumns", ("t1",)), ("primaryKeys", ("t1",)),
+    ("foreignKeys", ()), ("getTypeInfo", ()), ("procedures", ()), ("procedureColumns", ()),
+])
+def test_catalog_on_closed_cursor(cursor: pyodbc.Cursor, method, args):
+    "Catalog functions on a closed cursor raise instead of crashing"
+    cursor.close()
+    with pytest.raises(pyodbc.ProgrammingError, match="closed cursor"):
+        getattr(cursor, method)(*args)
+
+
+def test_fetch_after_column_name_decode_error(cnxn: pyodbc.Connection):
+    "If column names can't be decoded, a later fetch raises instead of reading bad state"
+    cnxn.setdecoding(pyodbc.SQL_WMETADATA, encoding="ascii")
+    cursor = cnxn.cursor()
+    with pytest.raises(UnicodeDecodeError):
+        cursor.execute('select 1 as "é"')
+    assert cursor.description is None
+    with pytest.raises(pyodbc.ProgrammingError):
+        cursor.fetchone()
+
+
+def test_decimal_mode(cursor: pyodbc.Cursor):
+    cnxn = cursor.connection
+    assert cnxn.decimal_mode == 'binary'
+    for mode in ('text', 'locale', 'binary'):
+        cnxn.decimal_mode = mode
+        assert cnxn.decimal_mode == mode
+    with pytest.raises(ValueError):
+        cnxn.decimal_mode = 'strict'
+    with pytest.raises(TypeError):
+        cnxn.decimal_mode = 1
+    with pytest.raises(TypeError):
+        del cnxn.decimal_mode
+    assert cnxn.decimal_mode == 'binary'
+
+
+@pytest.mark.parametrize('attr', ['decimal_mode', 'fetch_decimal_as_string'])
+def test_decimal_mode_bool_deprecated(cursor: pyodbc.Cursor, attr):
+    # The bool values select the paths fetch_decimal_as_string selected before 5.5.
+    cnxn = cursor.connection
+    with pytest.warns(FutureWarning, match=attr):
+        setattr(cnxn, attr, True)
+    assert cnxn.decimal_mode == 'locale'
+    with pytest.warns(FutureWarning, match=attr):
+        setattr(cnxn, attr, False)
+    assert cnxn.decimal_mode == 'binary'
+
+
+def test_fetch_decimal_as_string_read_deprecated(cursor: pyodbc.Cursor):
+    cnxn = cursor.connection
+    for mode, expected in [('binary', False), ('text', True), ('locale', True)]:
+        cnxn.decimal_mode = mode
+        with pytest.warns(FutureWarning, match='fetch_decimal_as_string'):
+            assert cnxn.fetch_decimal_as_string is expected
+
+
+def test_decimal_mode_bool_warning_as_error(cursor: pyodbc.Cursor):
+    # An exception raised by the warnings filter propagates and leaves the mode unchanged.
+    import warnings
+    cnxn = cursor.connection
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FutureWarning)
+        with pytest.raises(FutureWarning):
+            cnxn.fetch_decimal_as_string = True
+        with pytest.raises(FutureWarning):
+            cnxn.fetch_decimal_as_string
+    assert cnxn.decimal_mode == 'binary'
+
+
+@pytest.mark.parametrize("initsize", [1, 2, 3, 5])
+def test_readvar_initsize_tiny(cursor: pyodbc.Cursor, initsize):
+    # A buffer smaller than one character plus the terminator made the driver write before the
+    # buffer, and an odd size split UTF-16 characters.
+    cursor.execute("create table t1(n varchar(100), b blob)")
+    values = [("abcdéfghij", b"0123456789"), ("x", b"x"), ("", b"")]
+    for value in values:
+        cursor.execute("insert into t1 values (?, ?)", *value)
+    cursor.connection.readvar_initsize = initsize
+    rows = cursor.execute("select n, b from t1 order by length(n) desc").fetchall()
+    assert [tuple(row) for row in rows] == values
+
+
+@pytest.mark.parametrize("method", ["tablePrivileges", "statistics"])
+@pytest.mark.parametrize("length", [32768, 65533, 70000])
+def test_catalog_name_too_long(cursor: pyodbc.Cursor, method, length):
+    # The length is a SQLSMALLINT.  65533 characters used to become SQL_NTS, so the driver read
+    # past the end of the name looking for a terminator.
+    with pytest.raises(ValueError):
+        getattr(cursor, method)("x" * length)
+
+
+def test_catalog_utf8_metadata(cursor: pyodbc.Cursor):
+    # Catalog arguments encoded as UTF-8 for a W API used to end in a single NUL byte.
+    cursor.connection.setdecoding(pyodbc.SQL_WMETADATA, encoding='utf-8')
+    for name in ("t", "t1", "t12"):
+        assert isinstance(cursor.columns(table=name).fetchall(), list)
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16le"])
+def test_catalog_unencodable_name(cursor: pyodbc.Cursor, encoding):
+    "A catalog name that cannot be encoded raises the encoding error, not SystemError"
+    cursor.connection.setdecoding(pyodbc.SQL_WMETADATA, encoding=encoding)
+    with pytest.raises(UnicodeEncodeError):
+        cursor.columns(table="t\ud800")
+
+
+@pytest.mark.parametrize("sep", ["]", "z-a", "\\", "^"])
+def test_set_decimal_separator_regex_characters(sep):
+    # The separator was put into a regular expression character class unescaped, so "]" broke
+    # number cleaning and "z-a" raised after the separator had already been replaced.
+    saved = pyodbc.getDecimalSeparator()
+    try:
+        pyodbc.setDecimalSeparator(sep)
+        assert pyodbc.getDecimalSeparator() == sep
+    finally:
+        pyodbc.setDecimalSeparator(saved)
+    assert pyodbc.getDecimalSeparator() == saved
+
+
+def test_deleted_module_settings(connection_string: str):
+    "Deleting pyodbc.pooling, odbcversion, or lowercase uses the defaults instead of crashing"
+    # The environment is allocated by the first connect, so this needs a new interpreter.
+    script = """
+import sys, pyodbc
+del pyodbc.pooling, pyodbc.odbcversion, pyodbc.lowercase, pyodbc.native_uuid
+cnxn = pyodbc.connect(sys.argv[1])
+row = cnxn.execute("select 1 as Abc").fetchone()
+print(row.Abc)
+"""
+    env = dict(os.environ)
+    # Make sure the child imports the same pyodbc build.
+    env["PYTHONPATH"] = os.pathsep.join([os.path.dirname(pyodbc.__file__),
+                                         env.get("PYTHONPATH", "")])
+    result = subprocess.run([sys.executable, "-c", script, connection_string], env=env,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1"
+
+
+def test_nextset_closed_cursor(cursor: pyodbc.Cursor):
+    cursor.close()
+    with pytest.raises(pyodbc.ProgrammingError, match="closed cursor"):
+        cursor.nextset()

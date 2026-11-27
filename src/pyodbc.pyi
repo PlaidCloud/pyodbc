@@ -2,7 +2,9 @@
 # ruff: noqa: E303, N802, N803
 from __future__ import annotations
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
-from typing import Any, Final, Self
+from typing import Any, Final, Literal, Self
+
+from typing_extensions import deprecated
 import ctypes
 
 # SQLSetConnectAttr attributes
@@ -126,6 +128,22 @@ SQL_OJ_NESTED: int
 SQL_OJ_NOT_ORDERED: int
 SQL_OJ_INNER: int
 SQL_OJ_ALL_COMPARISON_OPS: int
+
+# SQL Server bulk copy (BCP): the connection attribute that enables it, and the host types
+# for Connection.bcp_bind_columns
+SQL_COPT_SS_BCP: int
+SQL_BCP_ON: int
+DB_IN: int
+SQLBIT: int
+SQLINT2: int
+SQLINT4: int
+SQLINT8: int
+SQLFLT4: int
+SQLFLT8: int
+SQLBINARY: int
+SQLUNIQUEID: int
+SQLCHARACTER: int
+SQLNCHAR: int
 
 # other ODBC database constants
 SQL_SCOPE_CURROW: int
@@ -362,14 +380,39 @@ class Connection:
         ...
 
     @property
+    def decimal_mode(self) -> Literal['binary', 'text', 'locale']:
+        """How DECIMAL and NUMERIC values are read.
+
+        'binary': into a SQL_NUMERIC_STRUCT, which is not affected by the locale.  This is
+        the default except for PostgreSQL.  The struct cannot hold NaN or Infinity, or more
+        than 38 digits.  A column whose driver returns text in place of the struct is read
+        as text.
+
+        'text': as text with no grouping separators: a sign, digits, and at most one decimal
+        point, which can be '.' or ','; or NaN, Infinity, or -Infinity.  Other text raises
+        DataError.  This is the default for PostgreSQL.
+
+        'locale': as text, after removing everything but digits, '-', and the separator from
+        setDecimalSeparator, which then becomes the decimal point.  For drivers that add
+        grouping separators or currency symbols.
+
+        Setting True or False is deprecated: they select 'locale' and 'binary', and will not
+        be accepted in pyodbc 6.0."""
+        ...
+
+    @decimal_mode.setter
+    def decimal_mode(self, value: Literal['binary', 'text', 'locale']) -> None:
+        ...
+
+    @property
+    @deprecated("Use decimal_mode; fetch_decimal_as_string will be removed in pyodbc 6.0.")
     def fetch_decimal_as_string(self) -> bool:
-        """If True, DECIMAL and NUMERIC values will be fetched as strings using the
-        legacy local-aware path.  If False (the default), values are fetched using a
-        binary representation that is not affected by the locale.  A column whose
-        driver returns text in place of the binary representation is read as text."""
+        """Deprecated; use decimal_mode.  True if decimal_mode is not 'binary'.  Setting True
+        selects 'locale' and False selects 'binary'."""
         ...
 
     @fetch_decimal_as_string.setter
+    @deprecated("Use decimal_mode; fetch_decimal_as_string will be removed in pyodbc 6.0.")
     def fetch_decimal_as_string(self, value: bool) -> None:
         ...
 
@@ -438,8 +481,7 @@ class Connection:
 
         Args:
             encoding: Text encoding codec, e.g. "utf-8".
-            ctype: The C data type when passing data - either pyodbc.SQL_CHAR or pyodbc.SQL_WCHAR.  More
-                relevant for Python 2.7.
+            ctype: The C data type when passing data - either pyodbc.SQL_CHAR or pyodbc.SQL_WCHAR.
         """
         ...
 
@@ -453,7 +495,7 @@ class Connection:
             sqltype: pyodbc.SQL_CHAR, pyodbc.SQL_WCHAR, or pyodbc.SQL_WMETADATA.
             encoding: Text encoding codec, e.g. "utf-8".
             ctype: The C data type to request from SQLGetData - either pyodbc.SQL_CHAR or
-                pyodbc.SQL_WCHAR.  More relevant for Python 2.7.
+                pyodbc.SQL_WCHAR.
         """
         ...
 
@@ -555,6 +597,45 @@ class Connection:
         """Close the connection.  Any uncommitted SQL statements will be rolled back."""
         ...
 
+    def bcp_init(self, table: str, direction: int = ..., batch_rows: int = 0,
+                 keep_nulls: bool = False, hints: str | None = None, max_errors: int = 0) -> None:
+        """Open a SQL Server bulk copy (BCP) session loading rows into `table`.  The
+        connection must have been opened with
+        attrs_before={pyodbc.SQL_COPT_SS_BCP: pyodbc.SQL_BCP_ON}; connection pooling matches
+        on the connection string alone, so give BCP connections their own (e.g. a distinct
+        APP=).  direction must be pyodbc.DB_IN.  If batch_rows is positive, bcp_sendrow() ends
+        a batch every batch_rows rows.  keep_nulls stores None as NULL in columns with a
+        DEFAULT, and hints passes BCP hints such as 'TABLOCK' or
+        'CHECK_CONSTRAINTS,FIRE_TRIGGERS'.  In autocommit mode bcp_batch() and bcp_done()
+        commit; closing the connection first discards the rows sent since the last batch."""
+        ...
+
+    def bcp_bind_columns(self, types: Sequence[int]) -> Any:
+        """Bind one buffer per table column, in table order, for the open BCP session and
+        return the context for bcp_setrow().  Each type is one of pyodbc.SQLBIT, SQLINT2,
+        SQLINT4, SQLINT8, SQLFLT4, SQLFLT8, SQLNCHAR (str), SQLCHARACTER (bytes in the client
+        code page, or ASCII str), SQLBINARY or SQLUNIQUEID."""
+        ...
+
+    def bcp_setrow(self, ctx: Any, row: tuple[Any, ...] | list[Any]) -> None:
+        """Convert one row, with a value (or None) per bound column, into the bound buffers."""
+        ...
+
+    def bcp_sendrow(self) -> None:
+        """Send the row prepared by bcp_setrow(); each row needs its own bcp_setrow()."""
+        ...
+
+    def bcp_batch(self, ctx: Any = None) -> int:
+        """End the current batch, storing the rows sent since the last one, and return their
+        number."""
+        ...
+
+    def bcp_done(self) -> int:
+        """End the BCP session, storing the rows sent since the last batch, and return their
+        number.  In autocommit mode they are committed; in manual-commit mode they join the
+        open transaction."""
+        ...
+
 
 class Cursor:
     """The class representing database cursors.  Cursors are vehicles for executing SQL
@@ -609,6 +690,41 @@ class Cursor:
 
     @fast_executemany.setter
     def fast_executemany(self, value: bool) -> None:
+        ...
+
+    @property
+    def use_bcp_fast(self) -> bool:
+        """With fast_executemany, load SQL Server INSERTs with the bulk copy (BCP) API whenever
+        that stores the same data as the plain path; otherwise the plain path runs.  The
+        connection must be opened with attrs_before={pyodbc.SQL_COPT_SS_BCP:
+        pyodbc.SQL_BCP_ON}, or the plain path runs; connection pooling matches on the
+        connection string alone, so give BCP connections their own (e.g. a distinct APP=).  A
+        failed load is rolled back in full and raised, and after a load rowcount is the number
+        of rows copied."""
+        ...
+
+    @use_bcp_fast.setter
+    def use_bcp_fast(self, value: bool) -> None:
+        ...
+
+    @property
+    def bcp_batch_rows(self) -> int:
+        """Rows per BCP batch; 0 sends all rows as one batch.  In autocommit mode each
+        completed batch is committed, and a failure discards only the batch it occurred in."""
+        ...
+
+    @bcp_batch_rows.setter
+    def bcp_batch_rows(self, value: int) -> None:
+        ...
+
+    @property
+    def bcp_tablock(self) -> bool:
+        """Pass the TABLOCK hint when using BCP, which takes a bulk-update table lock and allows
+        minimal logging."""
+        ...
+
+    @bcp_tablock.setter
+    def bcp_tablock(self, value: bool) -> None:
         ...
 
     @property

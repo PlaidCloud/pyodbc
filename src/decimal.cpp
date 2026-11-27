@@ -3,6 +3,9 @@
 #include "wrapper.h"
 #include "textenc.h"
 #include "decimal.h"
+#include "pyodbcmodule.h"
+#include "connection.h"
+#include "errors.h"
 
 static PyObject* decimal = 0;
 // The Decimal constructor.
@@ -11,16 +14,11 @@ static PyObject* re_sub = 0;
 static PyObject* re_compile = 0;
 static PyObject* re_escape = 0;
 
-// In Python 2.7, the 3 strings below are bytes objects.  In 3.x they are Unicode objects.
-
-
 static PyObject* pDecimalPoint = 0;
 // A "." object which we replace pLocaleDecimal with if they are not the same.
 
 static PyObject* pLocaleDecimal = 0;
 // The decimal character used by the locale.  This can be overridden by the user.
-//
-// In 2.7 this is a bytes object, otherwise unicode.
 
 static PyObject* pLocaleDecimalEscaped = 0;
 // A version of pLocaleDecimal escaped to be used in a regular expression.  (The character
@@ -35,20 +33,35 @@ bool InitializeDecimal() {
     // This is called when the module is initialized and creates globals.
 
     Object d(PyImport_ImportModule("decimal"));
+    if (!d)
+        return false;
     decimal = PyObject_GetAttrString(d, "Decimal");
     if (!decimal)
-        return 0;
+        return false;
+
     Object re(PyImport_ImportModule("re"));
+    if (!re)
+        return false;
     re_sub     = PyObject_GetAttrString(re, "sub");
     re_escape  = PyObject_GetAttrString(re, "escape");
     re_compile = PyObject_GetAttrString(re, "compile");
+    if (!re_sub || !re_escape || !re_compile)
+        return false;
 
     Object module(PyImport_ImportModule("locale"));
-    Object ldict(PyObject_CallMethod(module, "localeconv", 0));
-    Object point(PyDict_GetItemString(ldict, "decimal_point"));
-
-    if (!point)
+    if (!module)
         return false;
+    Object ldict(PyObject_CallMethod(module, "localeconv", 0));
+    if (!ldict)
+        return false;
+
+    // A borrowed reference, so it is not wrapped in an Object.
+    PyObject* point = PyDict_GetItemString(ldict, "decimal_point");
+    if (!point)
+    {
+        PyErr_SetString(PyExc_RuntimeError, "locale.localeconv() has no decimal_point");
+        return false;
+    }
 
     pDecimalPoint = PyUnicode_FromString(".");
 
@@ -68,40 +81,35 @@ PyObject* GetDecimalPoint() {
 
 bool SetDecimalPoint(PyObject* pNew)
 {
-    if (PyObject_RichCompareBool(pNew, pDecimalPoint, Py_EQ) == 1)
-    {
-        // They are the same.
-        Py_XDECREF(pLocaleDecimal);
-        pLocaleDecimal = pDecimalPoint;
-        Py_INCREF(pLocaleDecimal);
+    // Everything is built before any global is replaced, so a failure leaves the previous
+    // separator in effect.
 
-        Py_XDECREF(pLocaleDecimalEscaped);
-        pLocaleDecimalEscaped = 0;
-    }
-    else
-    {
-        // They are different, so we'll need a regular expression to match it so it can be
-        // replaced in getdata GetDataDecimal.
+    bool isPoint = PyObject_RichCompareBool(pNew, pDecimalPoint, Py_EQ) == 1;
+    if (PyErr_Occurred())
+        return false;
 
-        Py_XDECREF(pLocaleDecimal);
-        pLocaleDecimal = pNew;
-        Py_INCREF(pLocaleDecimal);
+    // The separator is escaped for use in a regular expression, both to replace it and inside
+    // the character class of characters to keep ("]" or "-" would otherwise change the class).
+    Object escaped(PyObject_CallFunctionObjArgs(re_escape, pNew, 0));
+    if (!escaped)
+        return false;
 
-        Object e(PyObject_CallFunctionObjArgs(re_escape, pNew, 0));
-        if (!e)
-            return false;
-
-        Py_XDECREF(pLocaleDecimalEscaped);
-        pLocaleDecimalEscaped = e.Detach();
-    }
-
-    Object s(PyUnicode_FromFormat("[^0-9%U-]+", pLocaleDecimal));
+    Object s(PyUnicode_FromFormat("[^0-9%U-]+", escaped.Get()));
     if (!s)
         return false;
 
     Object r(PyObject_CallFunctionObjArgs(re_compile, s.Get(), 0));
     if (!r)
         return false;
+
+    Py_INCREF(pNew);
+    Py_XDECREF(pLocaleDecimal);
+    pLocaleDecimal = pNew;
+
+    // pLocaleDecimalEscaped is zero when the separator is ".", meaning no replacement is
+    // needed in DecimalFromUnicode.
+    Py_XDECREF(pLocaleDecimalEscaped);
+    pLocaleDecimalEscaped = isPoint ? 0 : escaped.Detach();
 
     Py_XDECREF(pRegExpRemove);
     pRegExpRemove = r.Detach();
@@ -135,15 +143,127 @@ static PyObject* DecimalFromUnicode(PyObject* text)
     return PyObject_CallFunctionObjArgs(decimal, cleaned.Get(), 0);
 }
 
-PyObject* DecimalFromText(const TextEnc& enc, const byte* pb, Py_ssize_t cb)
+static bool MatchesNoCase(const char* pch, Py_ssize_t cch, const char* word)
 {
-    // Creates a Decimal object from a text buffer.
+    // Returns true if the cch characters at pch are `word`, which must be lowercase, ignoring
+    // ASCII case.
+    Py_ssize_t i = 0;
+    for (; i < cch && word[i]; i++)
+        if ((pch[i] | 0x20) != word[i])
+            return false;
+    return i == cch && word[i] == 0;
+}
+
+PyObject* DecimalFromStrictText(PyObject* text)
+{
+    // Creates a Decimal object from the text of a driver that never adds grouping separators,
+    // as Connection.decimal_mode "text" describes: an optional sign, digits with at most one
+    // decimal point, an optional exponent, or NaN, Inf, or Infinity.  Leading and trailing
+    // spaces are allowed.
+    //
+    // Without grouping, the one separator can only be the decimal point, so both '.' and ','
+    // are accepted whatever the locale.  (psqlODBC, for example, writes the decimal point of the
+    // process's C locale, while other drivers always write '.'.)  Anything else raises rather
+    // than being guessed at.
+
+    if (!PyUnicode_IS_ASCII(text))
+        goto invalid;
+
+    {
+        const char* pch = (const char*)PyUnicode_1BYTE_DATA(text);
+        Py_ssize_t start = 0;
+        Py_ssize_t end = PyUnicode_GET_LENGTH(text);
+        while (start < end && pch[start] == ' ')
+            start++;
+        while (end > start && pch[end - 1] == ' ')
+            end--;
+
+        Py_ssize_t i = start;
+        if (i < end && (pch[i] == '-' || pch[i] == '+'))
+            i++;
+
+        if (i < end && !(pch[i] >= '0' && pch[i] <= '9') && pch[i] != '.' && pch[i] != ',')
+        {
+            const char* word = pch + i;
+            Py_ssize_t cch = end - i;
+            if (MatchesNoCase(word, cch, "nan") || MatchesNoCase(word, cch, "inf") ||
+                MatchesNoCase(word, cch, "infinity"))
+            {
+                return PyObject_CallFunctionObjArgs(decimal, text, 0);
+            }
+            goto invalid;
+        }
+
+        Py_ssize_t cDigits = 0;
+        Py_ssize_t iComma = -1;
+        bool point = false;
+        for (; i < end; i++)
+        {
+            char ch = pch[i];
+            if (ch >= '0' && ch <= '9')
+                cDigits++;
+            else if ((ch == '.' || ch == ',') && !point)
+            {
+                point = true;
+                if (ch == ',')
+                    iComma = i;
+            }
+            else
+                break;
+        }
+        if (cDigits == 0)
+            goto invalid;
+
+        if (i < end && (pch[i] == 'e' || pch[i] == 'E'))
+        {
+            i++;
+            if (i < end && (pch[i] == '-' || pch[i] == '+'))
+                i++;
+            Py_ssize_t cExpDigits = 0;
+            while (i < end && pch[i] >= '0' && pch[i] <= '9')
+            {
+                i++;
+                cExpDigits++;
+            }
+            if (cExpDigits == 0)
+                goto invalid;
+        }
+        if (i != end)
+            goto invalid;
+
+        if (iComma == -1)
+            return PyObject_CallFunctionObjArgs(decimal, text, 0);
+
+        // Replace the decimal comma, which the Decimal constructor does not accept.
+        Py_ssize_t cch = end - start;
+        char* copy = (char*)PyMem_Malloc(cch);
+        if (!copy)
+            return PyErr_NoMemory();
+        memcpy(copy, pch + start, cch);
+        copy[iComma - start] = '.';
+        Object point_text(PyUnicode_FromStringAndSize(copy, cch));
+        PyMem_Free(copy);
+        if (!point_text)
+            return 0;
+        return PyObject_CallFunctionObjArgs(decimal, point_text.Get(), 0);
+    }
+
+invalid:
+    return RaiseErrorV(0, DataError,
+        "Unexpected text %R for a DECIMAL or NUMERIC value.  Set Connection.decimal_mode = "
+        "'locale' if the driver adds grouping separators or currency symbols.", text);
+}
+
+PyObject* DecimalFromText(const TextEnc& enc, const byte* pb, Py_ssize_t cb, bool strict)
+{
+    // Creates a Decimal object from a text buffer.  If `strict` is true, the text is parsed as
+    // DecimalFromStrictText describes; otherwise it is cleaned using the decimal separator.
 
     Object text(TextBufferToObject(enc, pb, cb));
     if (!text)
         return 0;
 
-    return DecimalFromUnicode(text.Get());
+    return strict ? DecimalFromStrictText(text.Get()) : DecimalFromUnicode(text.Get());
 }
 
 PyObject* DecimalFromAsciiText(const char* pch, Py_ssize_t cch)
@@ -162,40 +282,47 @@ PyObject* DecimalFromNumericStruct(const SQL_NUMERIC_STRUCT& num)
 {
     // Avoid the problems introduced by locale-specific delimiters in numeric strings
     // by having the driver provide the value using a well-defined binary structure.
+    //
+    // The value is formatted as "<digits>E<-scale>" and passed to the Decimal constructor once,
+    // which is much cheaper than building a Python int, its str, and a tuple of digit objects.
+    // The result is identical, including the exponent: Decimal("365688E-2") is
+    // Decimal("3656.88").
 
-    // Convert the little-endian (1) unsigned (0) magnitude to a Python int.
-    PyObject* magnitude = _PyLong_FromByteArray(num.val, SQL_MAX_NUMERIC_LEN, 1, 0);
-    if (!magnitude)
-        return NULL;
+    // The magnitude is a 128-bit little-endian unsigned integer.  Divide it by 10 repeatedly,
+    // collecting the remainders, which are the decimal digits from least significant up.
+    unsigned char val[SQL_MAX_NUMERIC_LEN];
+    memcpy(val, num.val, sizeof(val));
+    int top = SQL_MAX_NUMERIC_LEN;
+    while (top > 0 && val[top - 1] == 0)
+        top--;
 
-    // Convert magnitude to a tuple of decimal digits via str().
-    Object magStr(PyObject_Str(magnitude));
-    Py_DECREF(magnitude);
-    if (!magStr)
-        return NULL;
-
-    Py_ssize_t nDigits = PyUnicode_GET_LENGTH(magStr.Get());
-    Object digitTuple(PyTuple_New(nDigits));
-    if (!digitTuple)
-        return NULL;
-
-    for (Py_ssize_t i = 0; i < nDigits; i++)
+    char digits[40];  // 2**128 has 39 digits
+    int cDigits = 0;
+    do
     {
-        Py_UCS4 ch = PyUnicode_READ_CHAR(magStr.Get(), i);
-        PyObject* digit = PyLong_FromLong((long)(ch - '0'));
-        if (!digit)
-            return NULL;
-        PyTuple_SET_ITEM(digitTuple.Get(), i, digit);
-    }
+        unsigned int rem = 0;
+        for (int i = top - 1; i >= 0; i--)
+        {
+            unsigned int cur = (rem << 8) | val[i];
+            val[i] = (unsigned char)(cur / 10);
+            rem = cur % 10;
+        }
+        digits[cDigits++] = (char)('0' + rem);
+        while (top > 0 && val[top - 1] == 0)
+            top--;
+    } while (top > 0);
 
-    // Decimal sign: 0 = positive, 1 = negative (opposite of ODBC convention).
-    int decimalSign = (num.sign == 1) ? 0 : 1;
-    long exponent = -(long)num.scale;
+    char text[64];
+    int cch = 0;
+    if (num.sign != 1)  // ODBC: 1 is positive, 0 is negative
+        text[cch++] = '-';
+    while (cDigits > 0)
+        text[cch++] = digits[--cDigits];
+    cch += snprintf(text + cch, sizeof(text) - cch, "E%d", -(int)num.scale);
 
-    // Decimal((sign, (d, d, ...), exponent))
-    Object args(Py_BuildValue("((iOl))", decimalSign, digitTuple.Get(), exponent));
-    if (!args)
+    Object str(PyUnicode_FromStringAndSize(text, cch));
+    if (!str)
         return NULL;
 
-    return PyObject_CallObject(decimal, args.Get());
+    return PyObject_CallFunctionObjArgs(decimal, str.Get(), NULL);
 }

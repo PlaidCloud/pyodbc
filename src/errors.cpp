@@ -61,6 +61,10 @@ PyObject* RaiseErrorV(const char* sqlstate, PyObject* exc_class, const char* for
 {
     PyObject *pAttrs = 0, *pError = 0;
 
+    // This replaces any exception already set, as PyErr_SetString does.  Creating the new
+    // exception below calls Python code, which must not be called with an exception set.
+    PyErr_Clear();
+
     if (!sqlstate || !*sqlstate)
         sqlstate = "HY000";
 
@@ -202,9 +206,11 @@ PyObject* GetErrorFromHandle(Connection *conn, const char* szFunction, HDBC hdbc
     SQLINTEGER nNativeError;
     SQLSMALLINT cchMsg;
 
-    uint16_t sqlstateT[6];
+    // The data is UTF-16, but the buffers have room for a 4-byte SQLWCHAR so that a driver
+    // manager using one cannot write past them.
+    uint16_t sqlstateT[12];
     SQLSMALLINT msgLen = 1023;
-    uint16_t *szMsg = (uint16_t*) PyMem_Malloc((msgLen + 1) * sizeof(uint16_t));
+    uint16_t *szMsg = (uint16_t*) PyMem_Malloc((msgLen + 1) * sizeof(uint32_t));
 
     if (!szMsg) {
         PyErr_NoMemory();
@@ -256,10 +262,11 @@ PyObject* GetErrorFromHandle(Connection *conn, const char* szFunction, HDBC hdbc
         if (text_length_in_bytes)
             cchMsg /= sizeof(uint16_t);
 
-        // If needed, allocate a bigger error message buffer and retry.
-        if (cchMsg > msgLen - 1) {
-            msgLen = cchMsg + 1;
-            if (!PyMem_Realloc((BYTE**) &szMsg, (msgLen + 1) * sizeof(uint16_t))) {
+        // If needed, allocate a bigger error message buffer and retry.  The length is a
+        // SQLSMALLINT, so the longest message that can be read is SHRT_MAX - 1 characters.
+        if (cchMsg > msgLen - 1 && msgLen < SHRT_MAX) {
+            msgLen = cchMsg < SHRT_MAX ? (SQLSMALLINT)(cchMsg + 1) : (SQLSMALLINT)SHRT_MAX;
+            if (!PyMem_Realloc((BYTE**) &szMsg, (msgLen + 1) * sizeof(uint32_t))) {
                 PyErr_NoMemory();
                 PyMem_Free(szMsg);
                 return 0;
@@ -273,6 +280,12 @@ PyObject* GetErrorFromHandle(Connection *conn, const char* szFunction, HDBC hdbc
                 cchMsg /= sizeof(uint16_t);
         }
 
+        // Don't trust the length beyond the buffer offered: the message is read using it.
+        if (cchMsg < 0)
+            cchMsg = 0;
+        if (cchMsg > msgLen - 1)
+            cchMsg = msgLen - 1;
+
         // Not always NULL terminated (MS Access)
         sqlstateT[5] = 0;
 
@@ -280,6 +293,8 @@ PyObject* GetErrorFromHandle(Connection *conn, const char* szFunction, HDBC hdbc
         // Note that this will not work if the DM is using a different wide encoding (e.g. UTF-32).
         const char *unicode_enc = conn ? conn->metadata_enc.name : ENCSTR_UTF16NE;
         Object msgStr(PyUnicode_Decode((char*)szMsg, cchMsg * sizeof(uint16_t), unicode_enc, "strict"));
+        if (!msgStr)
+            PyErr_Clear();  // the record is skipped
 
         if (cchMsg != 0 && msgStr.Get())
         {
@@ -338,14 +353,19 @@ PyObject* GetErrorFromHandle(Connection *conn, const char* szFunction, HDBC hdbc
 }
 
 
-static bool GetSqlState(HSTMT hstmt, char* szSqlState)
+static bool GetSqlState(HSTMT hstmt, char (&szSqlState)[6])
 {
+    // The buffer length includes the terminator.  Passing 5 lets a driver manager that honors
+    // it truncate the SQLSTATE to 4 characters.
     SQLSMALLINT cchMsg;
     SQLRETURN ret;
 
+    memset(szSqlState, 0, sizeof(szSqlState));
     Py_BEGIN_ALLOW_THREADS
-    ret = SQLGetDiagField(SQL_HANDLE_STMT, hstmt, 1, SQL_DIAG_SQLSTATE, (SQLCHAR*)szSqlState, 5, &cchMsg);
+    ret = SQLGetDiagField(SQL_HANDLE_STMT, hstmt, 1, SQL_DIAG_SQLSTATE, (SQLCHAR*)szSqlState,
+                          sizeof(szSqlState), &cchMsg);
     Py_END_ALLOW_THREADS
+    szSqlState[5] = 0;
     return SQL_SUCCEEDED(ret);
 }
 

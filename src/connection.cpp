@@ -16,7 +16,9 @@
 #include "pyodbcmodule.h"
 #include "errors.h"
 #include "cnxninfo.h"
-
+#include "bcp_support.h"
+#include <memory>
+#include <new>
 
 static char connection_doc[] =
     "Connection objects manage connections to the database.\n"
@@ -165,10 +167,18 @@ static bool ApplyPreconnAttrs(HDBC hdbc, SQLINTEGER ikey, PyObject *value, char 
     }
     else if (PyUnicode_Check(value))
     {
-        Object po(PyUnicode_AsEncodedString(value, strencoding ? strencoding : "utf-16le", "strict"));
+        Object encoded(PyUnicode_AsEncodedString(value, strencoding ? strencoding : "utf-16le", "strict"));
+        if (!encoded)
+            return false;
+        // The value is passed with SQL_NTS, so it needs a NUL as wide as a character.  A bytes
+        // object only has one NUL byte, so copy it with 4 (enough for UTF-16 or UTF-32).
+        Py_ssize_t cb = PyBytes_GET_SIZE(encoded.Get());
+        Object po(PyBytes_FromStringAndSize(0, cb + 4));
         if (!po)
             return false;  // OOM
-        ivalue = (SQLPOINTER)PyBytes_AsString(po);
+        memcpy(PyBytes_AS_STRING(po.Get()), PyBytes_AS_STRING(encoded.Get()), (size_t)cb);
+        memset(PyBytes_AS_STRING(po.Get()) + cb, 0, 4);
+        ivalue = (SQLPOINTER)PyBytes_AS_STRING(po.Get());
         vallen = SQL_NTS;
         // PyList_Append increments the refcount, so the list owns the encoded buffer for as long
         // as the driver needs it; po releases our own reference when it goes out of scope.
@@ -179,9 +189,21 @@ static bool ApplyPreconnAttrs(HDBC hdbc, SQLINTEGER ikey, PyObject *value, char 
     {
         // To allow for possibility of setting multiple attributes more than once.
         Py_ssize_t len = PySequence_Size(value);
+        if (len < 0)
+            return false;
         for (Py_ssize_t i = 0; i < len; i++)
         {
             Object v(PySequence_GetItem(value, i));
+            if (!v)
+                return false;
+            // Only one level of nesting is allowed (CheckAttrsVal), but the sequence could
+            // return something else now than when it was checked.
+            if (!PyLong_Check(v) && !PyByteArray_Check(v) && !PyBytes_Check(v) && !PyUnicode_Check(v))
+            {
+                RaiseErrorV(0, PyExc_TypeError, "Unsupported attrs_before type: %s",
+                            Py_TYPE(v.Get())->tp_name);
+                return false;
+            }
             if (!ApplyPreconnAttrs(hdbc, ikey, v.Get(), strencoding, keepalives))
                 return false;
         }
@@ -246,16 +268,48 @@ PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, long timeou
         PyObject* value = 0;
 
         Object encodingholder;
-        char *strencoding = (encoding != 0) ?
-            (PyUnicode_Check(encoding) ? PyBytes_AsString(encodingholder = PyCodec_Encode(encoding, "utf-8", "strict")) :
-             PyBytes_Check(encoding) ? PyBytes_AsString(encoding) : 0) : 0;
+        char *strencoding = 0;
+        if (encoding && PyUnicode_Check(encoding))
+        {
+            encodingholder = PyCodec_Encode(encoding, "utf-8", "strict");
+            if (!encodingholder)
+            {
+                Py_DECREF(preconn_keepalives);
+                Py_BEGIN_ALLOW_THREADS
+                SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+                Py_END_ALLOW_THREADS
+                return 0;
+            }
+            strencoding = PyBytes_AS_STRING(encodingholder.Get());
+        }
+        else if (encoding && PyBytes_Check(encoding))
+        {
+            strencoding = PyBytes_AS_STRING(encoding);
+        }
 
         while (PyDict_Next(attrs_before, &pos, &key, &value))
         {
             SQLINTEGER ikey = 0;
 
             if (PyLong_Check(key))
-                ikey = (int)PyLong_AsLong(key);
+            {
+                // Attribute IDs are SQLINTEGERs.  long is 64 bits on most Unix platforms, so
+                // check the range rather than truncate to another attribute.
+                long lkey = PyLong_AsLong(key);
+                if (!PyErr_Occurred() && (lkey < INT_MIN || lkey > INT_MAX))
+                    PyErr_Format(PyExc_OverflowError,
+                        "attrs_before key %ld is outside the range of an ODBC attribute ID",
+                        lkey);
+                ikey = (SQLINTEGER)lkey;
+                if (PyErr_Occurred())
+                {
+                    Py_DECREF(preconn_keepalives);
+                    Py_BEGIN_ALLOW_THREADS
+                    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+                    Py_END_ALLOW_THREADS
+                    return 0;
+                }
+            }
             if (!ApplyPreconnAttrs(hdbc, ikey, value, strencoding, preconn_keepalives))
             {
                 Py_DECREF(preconn_keepalives);
@@ -308,9 +362,10 @@ PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, long timeou
     cnxn->map_sqltype_to_converter = 0;
     cnxn->readvar_initsize = 4096;
     cnxn->compat_diagrec_byte_length = false;
+    cnxn->bcp          = NULL;
 
     cnxn->attrs_before = attrs_before_o.Detach();
-    cnxn->fetch_decimal_as_string = false;
+    cnxn->decimal_mode = DECIMAL_MODE_BINARY;
 
     // This is an inefficient default, but should work all the time.  When we are offered
     // single-byte text we don't actually know what the encoding is.  For example, with SQL
@@ -400,6 +455,7 @@ PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, long timeou
     cnxn->varchar_maxlength      = p->varchar_maxlength;
     cnxn->wvarchar_maxlength     = p->wvarchar_maxlength;
     cnxn->binary_maxlength       = p->binary_maxlength;
+    cnxn->decimal_mode           = p->is_postgresql ? DECIMAL_MODE_TEXT : DECIMAL_MODE_BINARY;
 
     return reinterpret_cast<PyObject*>(cnxn);
 }
@@ -419,7 +475,9 @@ static PyObject* Connection_set_attr(PyObject* self, PyObject* args)
     if (!PyArg_ParseTuple(args, "iO", &id, &value))
         return 0;
 
-    Connection* cnxn = (Connection*)self;
+    Connection* cnxn = Connection_Validate(self);
+    if (!cnxn)
+        return 0;
 
     SQLRETURN ret;
     SQLWChar sqlchar;  // declared here so buffer stays alive across the call
@@ -427,6 +485,8 @@ static PyObject* Connection_set_attr(PyObject* self, PyObject* args)
     if (PyLong_Check(value))
     {
         long ival = PyLong_AsLong(value);
+        if (ival == -1 && PyErr_Occurred())
+            return 0;
         Py_BEGIN_ALLOW_THREADS
         ret = SQLSetConnectAttrW(cnxn->hdbc, id, (SQLPOINTER)(intptr_t)ival, SQL_IS_INTEGER);
         Py_END_ALLOW_THREADS
@@ -434,6 +494,8 @@ static PyObject* Connection_set_attr(PyObject* self, PyObject* args)
     else if (PyUnicode_Check(value))
     {
         sqlchar.set(value, "utf-16le");
+        if (!sqlchar.isValid())
+            return 0;
         Py_BEGIN_ALLOW_THREADS
         ret = SQLSetConnectAttrW(cnxn->hdbc, id, sqlchar.get(), SQL_NTS);
         Py_END_ALLOW_THREADS
@@ -464,12 +526,20 @@ static PyObject* Connection_conv_clear(PyObject* self, PyObject* args)
     Py_RETURN_NONE;
 }
 
+static void ReleaseBcpContext(BcpState* state);
+static void AbandonBcpSession(Connection* cnxn);
+
 static int Connection_clear(PyObject* self)
 {
     // Internal method for closing the connection.  (Not called close so it isn't confused with the external close
     // method.)
 
     Connection* cnxn = (Connection*)self;
+
+    // A bulk copy still in progress would otherwise survive SQLDisconnect in the connection
+    // pool, holding its locks.
+    if (cnxn->hdbc != SQL_NULL_HANDLE && cnxn->bcp && cnxn->bcp->sessionOpen)
+        AbandonBcpSession(cnxn);
 
     if (cnxn->hdbc != SQL_NULL_HANDLE)
     {
@@ -503,6 +573,14 @@ static int Connection_clear(PyObject* self)
 
     Py_XDECREF(cnxn->map_sqltype_to_converter);
     cnxn->map_sqltype_to_converter = 0;
+
+    if (cnxn->bcp)
+    {
+        cnxn->bcp->sessionOpen = false;
+        ReleaseBcpContext(cnxn->bcp);
+        PyMem_Free(cnxn->bcp);
+        cnxn->bcp = nullptr;
+    }
 
     return 0;
 }
@@ -773,7 +851,7 @@ static PyObject* Connection_getinfo(PyObject* self, PyObject* args)
     }
 
     if (i == _countof(aInfoTypes))
-        return RaiseErrorV(0, ProgrammingError, "Unsupported getinfo value: %d", infotype);
+        return RaiseErrorV(0, ProgrammingError, "Unsupported getinfo value: %lu", infotype);
 
     char szBuffer[0x1000];
     SQLSMALLINT cch = 0;
@@ -798,7 +876,8 @@ static PyObject* Connection_getinfo(PyObject* self, PyObject* args)
         break;
 
     case GI_STRING:
-        result = PyUnicode_FromStringAndSize(szBuffer, (Py_ssize_t)cch);
+        // On truncation cch is the full length, not what fit in the buffer.
+        result = PyUnicode_FromStringAndSize(szBuffer, min((Py_ssize_t)cch, (Py_ssize_t)sizeof(szBuffer) - 1));
         break;
 
     case GI_UINTEGER:
@@ -915,7 +994,16 @@ static int Connection_setautocommit(PyObject* self, PyObject* value, void* closu
         return -1;
     }
 
-    uintptr_t nAutoCommit = PyObject_IsTrue(value) ? SQL_AUTOCOMMIT_ON : SQL_AUTOCOMMIT_OFF;
+    const int on = PyObject_IsTrue(value);
+    if (on < 0 || !Connection_Validate(self))
+        return -1;
+    if (cnxn->bcp && cnxn->bcp->sessionOpen)
+    {
+        PyErr_SetString(ProgrammingError, "Cannot change autocommit while a BCP session is open.");
+        return -1;
+    }
+
+    uintptr_t nAutoCommit = on ? SQL_AUTOCOMMIT_ON : SQL_AUTOCOMMIT_OFF;
     SQLRETURN ret;
     Py_BEGIN_ALLOW_THREADS
     ret = SQLSetConnectAttr(cnxn->hdbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)nAutoCommit, SQL_IS_UINTEGER);
@@ -973,7 +1061,9 @@ static PyObject* Connection_getsearchescape(PyObject* self, void* closure)
 {
     UNUSED(closure);
 
-    Connection* cnxn = (Connection*)self;
+    Connection* cnxn = Connection_Validate(self);
+    if (!cnxn)
+        return 0;
 
     if (!cnxn->searchescape)
     {
@@ -987,7 +1077,9 @@ static PyObject* Connection_getsearchescape(PyObject* self, void* closure)
         if (!SQL_SUCCEEDED(ret))
             return RaiseErrorFromHandle(cnxn, "SQLGetInfo", cnxn->hdbc, SQL_NULL_HANDLE);
 
-        cnxn->searchescape = PyUnicode_FromStringAndSize(sz, (Py_ssize_t)cch);
+        cnxn->searchescape = PyUnicode_FromStringAndSize(sz, min((Py_ssize_t)cch, (Py_ssize_t)sizeof(sz) - 1));
+        if (!cnxn->searchescape)
+            return 0;
     }
 
     Py_INCREF(cnxn->searchescape);
@@ -1112,6 +1204,75 @@ static int Connection_settimeout(PyObject* self, PyObject* value, void* closure)
     return 0;
 }
 
+static const char* const DECIMAL_MODE_NAMES[] = { "binary", "text", "locale" };
+
+static PyObject* Connection_getdecimalmode(PyObject* self, void* closure)
+{
+    UNUSED(closure);
+
+    Connection* cnxn = Connection_Validate(self);
+    if (!cnxn)
+        return 0;
+
+    return PyUnicode_FromString(DECIMAL_MODE_NAMES[cnxn->decimal_mode]);
+}
+
+static int SetDecimalModeFromBool(Connection* cnxn, PyObject* value, const char* attr)
+{
+    // The bool values of fetch_decimal_as_string, kept until 6.0.  True keeps its old meaning,
+    // the locale path, rather than becoming "text".  Since the getter returns True for both
+    // text modes, True leaves 'text' alone, so saving and restoring the value changes nothing.
+
+    int isTrue = PyObject_IsTrue(value);
+    if (isTrue < 0)
+        return -1;
+    int mode = !isTrue ? DECIMAL_MODE_BINARY
+             : cnxn->decimal_mode == DECIMAL_MODE_TEXT ? DECIMAL_MODE_TEXT : DECIMAL_MODE_LOCALE;
+    if (PyErr_WarnFormat(PyExc_FutureWarning, 1,
+            "Setting %s to %s is deprecated and will not be supported in pyodbc 6.0; "
+            "set decimal_mode = '%s' instead", attr, isTrue ? "True" : "False",
+            DECIMAL_MODE_NAMES[mode]) < 0)
+        return -1;
+    cnxn->decimal_mode = mode;
+    return 0;
+}
+
+static int Connection_setdecimalmode(PyObject* self, PyObject* value, void* closure)
+{
+    UNUSED(closure);
+
+    Connection* cnxn = Connection_Validate(self);
+    if (!cnxn)
+        return -1;
+
+    if (value == 0)
+    {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete the decimal_mode attribute.");
+        return -1;
+    }
+
+    if (PyBool_Check(value))
+        return SetDecimalModeFromBool(cnxn, value, "decimal_mode");
+
+    if (PyUnicode_Check(value))
+    {
+        for (int i = 0; i < (int)_countof(DECIMAL_MODE_NAMES); i++)
+        {
+            if (PyUnicode_CompareWithASCIIString(value, DECIMAL_MODE_NAMES[i]) == 0)
+            {
+                cnxn->decimal_mode = i;
+                return 0;
+            }
+        }
+        PyErr_Format(PyExc_ValueError,
+            "decimal_mode must be 'binary', 'text', or 'locale', not %R", value);
+        return -1;
+    }
+
+    PyErr_Format(PyExc_TypeError, "decimal_mode must be a str, not %s", Py_TYPE(value)->tp_name);
+    return -1;
+}
+
 static PyObject* Connection_getfetchdecimalasstring(PyObject* self, void* closure)
 {
     UNUSED(closure);
@@ -1120,9 +1281,12 @@ static PyObject* Connection_getfetchdecimalasstring(PyObject* self, void* closur
     if (!cnxn)
         return 0;
 
-    PyObject* result = cnxn->fetch_decimal_as_string ? Py_True : Py_False;
-    Py_INCREF(result);
-    return result;
+    if (PyErr_WarnEx(PyExc_FutureWarning,
+            "fetch_decimal_as_string is deprecated and will be removed in pyodbc 6.0; "
+            "use decimal_mode instead", 1) < 0)
+        return 0;
+
+    return PyBool_FromLong(cnxn->decimal_mode != DECIMAL_MODE_BINARY);
 }
 
 static int Connection_setfetchdecimalasstring(PyObject* self, PyObject* value, void* closure)
@@ -1139,8 +1303,7 @@ static int Connection_setfetchdecimalasstring(PyObject* self, PyObject* value, v
         return -1;
     }
 
-    cnxn->fetch_decimal_as_string = PyObject_IsTrue(value);
-    return 0;
+    return SetDecimalModeFromBool(cnxn, value, "fetch_decimal_as_string");
 }
 
 static PyObject* Connection_getcompat_diagrec_byte_length(PyObject* self, void* closure)
@@ -1440,7 +1603,6 @@ static PyObject* Connection_setencoding(PyObject* self, PyObject* args, PyObject
 {
     Connection* cnxn = (Connection*)self;
 
-    // In Python 3 we only support encodings for Unicode text.
     char* encoding = 0;
     int ctype = 0;
     static char *kwlist[] = { "encoding", "ctype", 0 };
@@ -1529,24 +1691,561 @@ static PyObject* Connection_exit(PyObject* self, PyObject* args)
     Py_RETURN_NONE;
 }
 
+/*=======================================================================================*/
+// Low-level SQL Server bulk copy (BCP) API
+/*=======================================================================================*/
+
+static const char* BCPCTX_CAPSULE = "pyodbc.BCPContext";
+
+static void BcpContext_Free(PyObject* cap)
+{
+    BcpCtx* ctx = (BcpCtx*)PyCapsule_GetPointer(cap, BCPCTX_CAPSULE);
+    if (!ctx)
+        return;
+    BcpFreeColumns(ctx->cols, ctx->ncols);
+    PyMem_Free(ctx);
+}
+
+/**
+ * Drops the connection's reference to the bound context and frees the session's table name and
+ * hints.  Called only once the driver no longer reads them: after bcp_done, or after the
+ * connection is disconnected.
+ */
+static void ReleaseBcpContext(BcpState* state)
+{
+    PyMem_Free(state->tableName);
+    PyMem_Free(state->hints);
+    state->tableName = state->hints = 0;
+    if (!state->context)
+        return;
+    BcpCtx* ctx = (BcpCtx*)PyCapsule_GetPointer(state->context, BCPCTX_CAPSULE);
+    if (ctx)
+        ctx->conn = 0;
+    Py_CLEAR(state->context);
+}
+
+/** Returns the connection if it is open and uses a driver BCP works with, raising if not. */
+static Connection* ConnectionWithBcp(PyObject* self)
+{
+    Connection* cnxn = Connection_Validate(self);
+    if (!cnxn)
+        return 0;
+    if (!BcpEnsureLoaded(cnxn)) {
+        if (!PyErr_Occurred())
+            PyErr_SetString(PyExc_NotImplementedError, "BCP needs the Microsoft ODBC Driver 13 or later for SQL Server.");
+        return 0;
+    }
+    if (cnxn->bcp->fastLoad) {
+        PyErr_SetString(ProgrammingError, "A fast_executemany BCP load is running on this connection.");
+        return 0;
+    }
+    return cnxn;
+}
+
+/** Returns the connection if it also has a BCP session open, raising if not. */
+static Connection* ConnectionWithBcpSession(PyObject* self)
+{
+    Connection* cnxn = ConnectionWithBcp(self);
+    if (cnxn && !cnxn->bcp->sessionOpen) {
+        PyErr_SetString(ProgrammingError, "No BCP session is open; call bcp_init first.");
+        return 0;
+    }
+    return cnxn;
+}
+
+/** Returns the context in `cap` if it is the one bound on the open session, raising if not. */
+static BcpCtx* BoundBcpContext(Connection* cnxn, PyObject* cap)
+{
+    if (!cap || cap != cnxn->bcp->context) {
+        PyErr_SetString(PyExc_ValueError, "Not the BCP context bound on this connection's open session.");
+        return 0;
+    }
+    return (BcpCtx*)PyCapsule_GetPointer(cap, BCPCTX_CAPSULE);
+}
+
+/**
+ * Ends the session's own transaction, if it has one, and restores autocommit.  A failed commit
+ * is raised (unless an exception is already set) and rolled back.
+ */
+static bool EndBcpTransaction(Connection* cnxn, bool commit)
+{
+    BcpState* state = cnxn->bcp;
+    if (!state->ownsTransaction)
+        return true;
+    bool ok = BcpEndTransaction(cnxn->hdbc, commit);
+    if (!ok && commit) {
+        if (!PyErr_Occurred())
+            RaiseErrorFromHandle(cnxn, "SQLEndTran", cnxn->hdbc, SQL_NULL_HANDLE);
+        BcpEndTransaction(cnxn->hdbc, false);
+    }
+    BcpSetAutocommit(cnxn->hdbc, true);
+    state->ownsTransaction = false;
+    return ok || !commit;
+}
+
+/** Closes the session with bcp_done and releases its context, raising if that fails. */
+static bool EndBcpSession(Connection* cnxn, DBINT* rows)
+{
+    BcpState* state = cnxn->bcp;
+    DBINT n;
+    Py_BEGIN_ALLOW_THREADS
+    n = state->procs.bcp_done(cnxn->hdbc);
+    Py_END_ALLOW_THREADS
+    bool ok = n >= 0;
+    if (!ok)
+        RaiseErrorFromHandle(cnxn, "bcp_done", cnxn->hdbc, SQL_NULL_HANDLE);
+    if (!EndBcpTransaction(cnxn, ok))
+        ok = false;
+    state->sessionOpen = false;
+    ReleaseBcpContext(state);
+    if (rows)
+        *rows = n;
+    return ok;
+}
+
+/**
+ * Closes the session without keeping the rows sent since the last batch, after an error that
+ * has already been raised or when the connection closes with the session still open.
+ */
+static void AbandonBcpSession(Connection* cnxn)
+{
+    BcpState* state = cnxn->bcp;
+    Py_BEGIN_ALLOW_THREADS
+    state->procs.bcp_done(cnxn->hdbc);
+    Py_END_ALLOW_THREADS
+    EndBcpTransaction(cnxn, false);
+    state->sessionOpen = false;
+    ReleaseBcpContext(state);
+}
+
+/**
+ * Ends the current batch with bcp_batch, committing it in autocommit mode; raises on failure.
+ * The batch is over either way, so the count of rows towards the next one restarts first.
+ */
+static bool BatchBcpSession(Connection* cnxn, DBINT* rows)
+{
+    BcpState* state = cnxn->bcp;
+    state->unbatchedRows = 0;
+    DBINT n;
+    Py_BEGIN_ALLOW_THREADS
+    n = state->procs.bcp_batch(cnxn->hdbc);
+    Py_END_ALLOW_THREADS
+    if (n < 0) {
+        RaiseErrorFromHandle(cnxn, "bcp_batch", cnxn->hdbc, SQL_NULL_HANDLE);
+        return false;
+    }
+    if (state->ownsTransaction && !BcpEndTransaction(cnxn->hdbc, true)) {
+        RaiseErrorFromHandle(cnxn, "SQLEndTran", cnxn->hdbc, SQL_NULL_HANDLE);
+        return false;
+    }
+    if (rows)
+        *rows = n;
+    return true;
+}
+
+static char bcp_init_doc[] =
+"bcp_init(table, direction=DB_IN, batch_rows=0, keep_nulls=False, hints=None, max_errors=0) -> None\n"
+"\n"
+"Opens a SQL Server bulk copy (BCP) session loading rows into a table.  The connection must have\n"
+"been opened with attrs_before={pyodbc.SQL_COPT_SS_BCP: pyodbc.SQL_BCP_ON}.  Connection pooling\n"
+"matches on the connection string alone, so give BCP connections their own (e.g. a distinct APP=)\n"
+"or a pooled connection opened without the attribute may be returned.  Bind the columns with\n"
+"bcp_bind_columns(), send each row with bcp_setrow() and bcp_sendrow(), and finish with bcp_done().\n"
+"In autocommit mode bcp_batch() and bcp_done() commit the rows sent so far; if the connection is\n"
+"closed first, the rows sent since the last batch are discarded.\n"
+"\n"
+"Arguments:\n"
+"  table      : The destination table, named as in T-SQL (e.g. 'dbo.MyTable').\n"
+"  direction  : Must be pyodbc.DB_IN: only loading into a table is supported.\n"
+"  batch_rows : If positive, bcp_sendrow() calls bcp_batch() after every batch_rows rows.\n"
+"  keep_nulls : If true, None is stored as NULL even in a column with a DEFAULT, as an INSERT\n"
+"               would store it; otherwise BCP stores the column's default.\n"
+"  hints      : BCP hints, e.g. 'TABLOCK'.  BCP checks CHECK constraints and fires triggers only\n"
+"               when given 'CHECK_CONSTRAINTS' and 'FIRE_TRIGGERS'.  A fired trigger that rolls\n"
+"               back the load leaves the connection unusable while the session runs in a\n"
+"               transaction (always, in either commit mode): the driver loses track of it.\n"
+"  max_errors : If positive, passed to bcp_control(BCPMAXERRS).";
+
+/**
+ * A copy of `s` as NUL-terminated UTF-16 for the driver, freed with PyMem_Free, or null with an
+ * error raised.  A NUL in `s` raises ValueError, since the driver would stop reading there.
+ */
+static SQLWCHAR* BcpWideCopy(PyObject* s, const char* what)
+{
+    if (PyUnicode_FindChar(s, 0, 0, PyUnicode_GET_LENGTH(s), 1) != -1) {
+        PyErr_Format(PyExc_ValueError, "The %s must not contain a NUL character.", what);
+        return 0;
+    }
+    SQLWChar wide(s, ENCSTR_UTF16NE);
+    if (!wide.isValid()) {
+        PyErr_Format(PyExc_ValueError, "The %s cannot be encoded as UTF-16.", what);
+        return 0;
+    }
+    const SQLWCHAR* chars = wide;
+    size_t n = 0;
+    while (chars[n])
+        ++n;
+    SQLWCHAR* copy = (SQLWCHAR*)PyMem_Malloc((n + 1) * sizeof(SQLWCHAR));
+    if (!copy) {
+        PyErr_NoMemory();
+        return 0;
+    }
+    memcpy(copy, chars, (n + 1) * sizeof(SQLWCHAR));
+    return copy;
+}
+
+static PyObject* Connection_bcp_init(PyObject* self, PyObject* args, PyObject* kwargs)
+{
+    PyObject* table = 0;
+    int direction = DB_IN;
+    long batch_rows = 0;
+    int keep_nulls = 0;
+    PyObject* hints = Py_None;
+    long max_errors = 0;
+
+    static char* kwlist[] = {"table", "direction", "batch_rows", "keep_nulls", "hints", "max_errors", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "U|ilpOl", kwlist,
+                                     &table, &direction, &batch_rows, &keep_nulls, &hints, &max_errors))
+        return 0;
+    if (direction != DB_IN) {
+        PyErr_SetString(PyExc_ValueError, "Only DB_IN is supported.");
+        return 0;
+    }
+    if (batch_rows < 0 || max_errors < 0) {
+        PyErr_SetString(PyExc_ValueError, "batch_rows and max_errors must not be negative.");
+        return 0;
+    }
+    if (hints != Py_None && !PyUnicode_Check(hints)) {
+        PyErr_SetString(PyExc_TypeError, "hints must be a str or None.");
+        return 0;
+    }
+
+    Connection* cnxn = ConnectionWithBcp(self);
+    if (!cnxn)
+        return 0;
+    BcpState* state = cnxn->bcp;
+    if (state->sessionOpen) {
+        PyErr_SetString(ProgrammingError, "A BCP session is already open; call bcp_done first.");
+        return 0;
+    }
+
+    state->tableName = BcpWideCopy(table, "table name");
+    if (!state->tableName)
+        return 0;
+    if (hints != Py_None && PyUnicode_GET_LENGTH(hints) > 0 && !(state->hints = BcpWideCopy(hints, "hints"))) {
+        ReleaseBcpContext(state);
+        return 0;
+    }
+    state->ownsTransaction = cnxn->nAutoCommit == SQL_AUTOCOMMIT_ON;
+    if (state->ownsTransaction && !BcpSetAutocommit(cnxn->hdbc, false)) {
+        state->ownsTransaction = false;
+        ReleaseBcpContext(state);
+        return RaiseErrorFromHandle(cnxn, "SQLSetConnectAttr", cnxn->hdbc, SQL_NULL_HANDLE);
+    }
+    SQLRETURN rc;
+    Py_BEGIN_ALLOW_THREADS
+    rc = state->procs.bcp_initW(cnxn->hdbc, state->tableName, nullptr, nullptr, DB_IN);
+    Py_END_ALLOW_THREADS
+    if (rc != SUCCEED) {
+        RaiseErrorFromHandle(cnxn, "bcp_init", cnxn->hdbc, SQL_NULL_HANDLE);
+        EndBcpTransaction(cnxn, false);
+        ReleaseBcpContext(state);
+        return 0;
+    }
+    state->sessionOpen = true;
+    state->rowReady = false;
+    state->batchRows = batch_rows;
+    state->unbatchedRows = 0;
+
+    const char* failed = 0;
+    if (keep_nulls && state->procs.bcp_control(cnxn->hdbc, BCPKEEPNULLS, (void*)(uintptr_t)1) != SUCCEED)
+        failed = "bcp_control(BCPKEEPNULLS)";
+    else if (max_errors > 0 && state->procs.bcp_control(cnxn->hdbc, BCPMAXERRS, (void*)(uintptr_t)max_errors) != SUCCEED)
+        failed = "bcp_control(BCPMAXERRS)";
+    else if (state->hints && state->procs.bcp_control(cnxn->hdbc, BCPHINTSW, (void*)state->hints) != SUCCEED)
+        failed = "bcp_control(BCPHINTS)";
+    if (failed) {
+        RaiseErrorFromHandle(cnxn, failed, cnxn->hdbc, SQL_NULL_HANDLE);
+        AbandonBcpSession(cnxn);
+        return 0;
+    }
+    Py_RETURN_NONE;
+}
+
+static char bcp_bind_columns_doc[] =
+"bcp_bind_columns(types) -> BCPContext\n"
+"\n"
+"Binds one buffer per table column for the open BCP session, in table column order, and returns\n"
+"the context to pass to bcp_setrow().  Columns can be bound once per session.\n"
+"\n"
+"Arguments:\n"
+"  types : One host type per column.  Each takes these Python values (or None for NULL):\n"
+"            pyodbc.SQLBIT       True, False, 0 or 1\n"
+"            pyodbc.SQLINT2, pyodbc.SQLINT4, pyodbc.SQLINT8   int\n"
+"            pyodbc.SQLFLT4, pyodbc.SQLFLT8                   float\n"
+"            pyodbc.SQLNCHAR     str, sent as UTF-16\n"
+"            pyodbc.SQLCHARACTER bytes encoded in the client's code page, or ASCII str\n"
+"            pyodbc.SQLBINARY    bytes or bytearray\n"
+"            pyodbc.SQLUNIQUEID  uuid.UUID, or its 16 bytes_le\n"
+"\n"
+"Usage:\n"
+"  conn.bcp_init('dbo.MyTable')\n"
+"  ctx = conn.bcp_bind_columns([pyodbc.SQLINT4, pyodbc.SQLNCHAR])\n"
+"  for row in rows:\n"
+"      conn.bcp_setrow(ctx, row)\n"
+"      conn.bcp_sendrow()\n"
+"  count = conn.bcp_done()";
+
+static bool IsLowLevelHostType(long t, bool* fixed)
+{
+    *fixed = t == SQLBIT || t == SQLINT2 || t == SQLINT4 || t == SQLINT8 || t == SQLFLT4 || t == SQLFLT8 || t == SQLUNIQUEID;
+    return *fixed || t == SQLBINARY || t == SQLCHARACTER || t == SQLNCHAR;
+}
+
+static PyObject* Connection_bcp_bind_columns(PyObject* self, PyObject* args, PyObject* kwargs)
+{
+    PyObject* types = 0;
+    static char* kwlist[] = {"types", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", kwlist, &types))
+        return 0;
+
+    Connection* cnxn = ConnectionWithBcpSession(self);
+    if (!cnxn)
+        return 0;
+    BcpState* state = cnxn->bcp;
+    if (state->context) {
+        PyErr_SetString(ProgrammingError, "The columns of this BCP session are already bound.");
+        return 0;
+    }
+
+    Object seq(PySequence_Tuple(types));
+    if (!seq.IsValid()) {
+        if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+            PyErr_Clear();
+            PyErr_SetString(PyExc_TypeError, "types must be a sequence of BCP host types");
+        }
+        return 0;
+    }
+    const Py_ssize_t ncols = PyTuple_GET_SIZE(seq.Get());
+    if (ncols <= 0 || ncols > INT_MAX) {
+        PyErr_SetString(PyExc_ValueError, "types must not be empty");
+        return 0;
+    }
+
+    BcpCtx* ctx = (BcpCtx*)PyMem_Calloc(1, sizeof(BcpCtx));
+    if (!ctx)
+        return PyErr_NoMemory();
+    ctx->cols = (BcpCol*)PyMem_Calloc((size_t)ncols, sizeof(BcpCol));
+    if (!ctx->cols) {
+        PyMem_Free(ctx);
+        return PyErr_NoMemory();
+    }
+    ctx->ncols = (int)ncols;
+    Object cap(PyCapsule_New(ctx, BCPCTX_CAPSULE, BcpContext_Free));
+    if (!cap.IsValid()) {
+        BcpFreeColumns(ctx->cols, ctx->ncols);
+        PyMem_Free(ctx);
+        return 0;
+    }
+
+    for (int i = 0; i < ctx->ncols; ++i) {
+        long t = PyLong_AsLong(PyTuple_GET_ITEM(seq.Get(), i));
+        if (t == -1 && PyErr_Occurred())
+            return 0;
+        bool fixed;
+        if (!IsLowLevelHostType(t, &fixed)) {
+            PyErr_Format(PyExc_ValueError, "Unsupported BCP host type %ld in types[%d].", t, i);
+            return 0;
+        }
+        BcpCol* c = &ctx->cols[i];
+        c->ordinal = i + 1;
+        c->hostType = (int)t;
+        c->prefix = fixed ? 0 : 8;
+        c->setsCollen = !fixed;
+    }
+
+    if (!ConnectionWithBcpSession(self))
+        return 0;
+    if (cnxn->bcp != state || state->context) {
+        PyErr_SetString(ProgrammingError, "The BCP session changed while its column types were read.");
+        return 0;
+    }
+    for (int i = 0; i < ctx->ncols; ++i)
+        if (!BcpAllocColumn(&ctx->cols[i]))
+            return 0;
+
+    for (int i = 0; i < ctx->ncols; ++i) {
+        if (!BcpBindColumn(cnxn, &ctx->cols[i])) {
+            RaiseErrorFromHandle(cnxn, "bcp_bind", cnxn->hdbc, SQL_NULL_HANDLE);
+            state->context = cap.Detach();
+            AbandonBcpSession(cnxn);
+            return 0;
+        }
+    }
+
+    ctx->conn = cnxn;
+    state->context = cap.Get();
+    Py_INCREF(state->context);
+    return cap.Detach();
+}
+
+static char bcp_setrow_doc[] =
+"bcp_setrow(ctx, row) -> None\n"
+"\n"
+"Converts one row of values into the buffers bound by bcp_bind_columns(); bcp_sendrow() then\n"
+"sends it.\n"
+"\n"
+"Arguments:\n"
+"  ctx : The context returned by bcp_bind_columns().\n"
+"  row : A tuple or list with one value per bound column.";
+
+static PyObject* Connection_bcp_setrow(PyObject* self, PyObject* args)
+{
+    PyObject* cap = 0;
+    PyObject* row = 0;
+    if (!PyArg_ParseTuple(args, "OO", &cap, &row))
+        return 0;
+
+    Connection* cnxn = ConnectionWithBcpSession(self);
+    if (!cnxn)
+        return 0;
+    BcpCtx* ctx = BoundBcpContext(cnxn, cap);
+    if (!ctx)
+        return 0;
+    cnxn->bcp->rowReady = false;
+
+    std::unique_ptr<BcpLowLevelValue[]> values(new (std::nothrow) BcpLowLevelValue[(size_t)ctx->ncols]);
+    if (!values)
+        return PyErr_NoMemory();
+    for (int i = 0; i < ctx->ncols; ++i) {
+        if (!(PyTuple_Check(row) || PyList_Check(row)) || PySequence_Fast_GET_SIZE(row) != ctx->ncols) {
+            PyErr_SetString(PyExc_TypeError, "row must be a tuple or list with one value per bound column");
+            return 0;
+        }
+        Object cell(PySequence_Fast_GET_ITEM(row, i));
+        Py_INCREF(cell.Get());
+        if (!BcpConvertLowLevelValue(&ctx->cols[i], cell, &values[(size_t)i]))
+            return 0;
+    }
+
+    if (!cnxn->hdbc || !cnxn->bcp || !cnxn->bcp->sessionOpen || cnxn->bcp->context != cap) {
+        PyErr_SetString(ProgrammingError, "The BCP session changed while the row was being converted.");
+        return 0;
+    }
+    for (int i = 0; i < ctx->ncols; ++i) {
+        if (!BcpWriteLowLevelValue(cnxn, &ctx->cols[i], values[(size_t)i])) {
+            if (!PyErr_Occurred())
+                RaiseErrorFromHandle(cnxn, "bcp_collen", cnxn->hdbc, SQL_NULL_HANDLE);
+            return 0;
+        }
+    }
+    cnxn->bcp->rowReady = true;
+    Py_RETURN_NONE;
+}
+
+static char bcp_sendrow_doc[] =
+"bcp_sendrow() -> None\n"
+"\n"
+"Sends the row prepared by bcp_setrow(), ending a batch if bcp_init's batch_rows is reached.\n"
+"Each row needs its own successful bcp_setrow() first.";
+
+static PyObject* Connection_bcp_sendrow(PyObject* self, PyObject* args)
+{
+    UNUSED(args);
+    Connection* cnxn = ConnectionWithBcpSession(self);
+    if (!cnxn)
+        return 0;
+    BcpState* state = cnxn->bcp;
+    if (!state->context) {
+        PyErr_SetString(ProgrammingError, "Bind the columns with bcp_bind_columns first.");
+        return 0;
+    }
+    if (!state->rowReady) {
+        PyErr_SetString(ProgrammingError, "Prepare the row with bcp_setrow first.");
+        return 0;
+    }
+    state->rowReady = false;
+
+    SQLRETURN rc;
+    Py_BEGIN_ALLOW_THREADS
+    rc = state->procs.bcp_sendrow(cnxn->hdbc);
+    Py_END_ALLOW_THREADS
+    if (rc != SUCCEED)
+        return RaiseErrorFromHandle(cnxn, "bcp_sendrow", cnxn->hdbc, SQL_NULL_HANDLE);
+
+    if (state->batchRows > 0 && ++state->unbatchedRows >= state->batchRows && !BatchBcpSession(cnxn, 0))
+        return 0;
+    Py_RETURN_NONE;
+}
+
+static char bcp_batch_doc[] =
+"bcp_batch([ctx]) -> int\n"
+"\n"
+"Ends the current batch: the server stores the rows sent since the last batch, committing them\n"
+"in autocommit mode.  Returns the number of rows in the batch.  The optional ctx is checked\n"
+"to be the bound context.";
+
+static PyObject* Connection_bcp_batch(PyObject* self, PyObject* args)
+{
+    PyObject* cap = 0;
+    if (!PyArg_ParseTuple(args, "|O", &cap))
+        return 0;
+
+    Connection* cnxn = ConnectionWithBcpSession(self);
+    if (!cnxn)
+        return 0;
+    if (cap && cap != Py_None && !BoundBcpContext(cnxn, cap))
+        return 0;
+
+    DBINT rows = 0;
+    if (!BatchBcpSession(cnxn, &rows))
+        return 0;
+    return PyLong_FromLong((long)rows);
+}
+
+static char bcp_done_doc[] =
+"bcp_done() -> int\n"
+"\n"
+"Ends the BCP session, storing the rows sent since the last batch, and returns their number.\n"
+"In autocommit mode they are committed; in manual-commit mode they join the open transaction.";
+
+static PyObject* Connection_bcp_done(PyObject* self, PyObject* args)
+{
+    UNUSED(args);
+    Connection* cnxn = ConnectionWithBcpSession(self);
+    if (!cnxn)
+        return 0;
+    DBINT rows = 0;
+    if (!EndBcpSession(cnxn, &rows))
+        return 0;
+    return PyLong_FromLong((long)rows);
+}
+
 
 static struct PyMethodDef Connection_methods[] =
 {
-    { "cursor",                  Connection_cursor,          METH_NOARGS,  cursor_doc     },
-    { "close",                   Connection_close,           METH_NOARGS,  close_doc      },
-    { "execute",                 Connection_execute,         METH_VARARGS, execute_doc    },
-    { "commit",                  Connection_commit,          METH_NOARGS,  commit_doc     },
-    { "rollback",                Connection_rollback,        METH_NOARGS,  rollback_doc   },
-    { "getinfo",                 Connection_getinfo,         METH_VARARGS, getinfo_doc    },
-    { "add_output_converter",    Connection_conv_add,        METH_VARARGS, conv_add_doc   },
-    { "remove_output_converter", Connection_conv_remove,     METH_VARARGS, conv_remove_doc },
-    { "get_output_converter",    Connection_conv_get,        METH_VARARGS, conv_get_doc },
-    { "clear_output_converters", Connection_conv_clear,      METH_NOARGS,  conv_clear_doc },
+    { "cursor",                  Connection_cursor,          METH_NOARGS,  cursor_doc       },
+    { "close",                   Connection_close,           METH_NOARGS,  close_doc        },
+    { "execute",                 Connection_execute,         METH_VARARGS, execute_doc      },
+    { "commit",                  Connection_commit,          METH_NOARGS,  commit_doc       },
+    { "rollback",                Connection_rollback,        METH_NOARGS,  rollback_doc     },
+    { "getinfo",                 Connection_getinfo,         METH_VARARGS, getinfo_doc      },
+    { "add_output_converter",    Connection_conv_add,        METH_VARARGS, conv_add_doc     },
+    { "remove_output_converter", Connection_conv_remove,     METH_VARARGS, conv_remove_doc  },
+    { "get_output_converter",    Connection_conv_get,        METH_VARARGS, conv_get_doc     },
+    { "clear_output_converters", Connection_conv_clear,      METH_NOARGS,  conv_clear_doc   },
     { "setdecoding",             (PyCFunction)Connection_setdecoding,     METH_VARARGS|METH_KEYWORDS, setdecoding_doc },
     { "setencoding",             (PyCFunction)Connection_setencoding,     METH_VARARGS|METH_KEYWORDS, 0 },
     { "set_attr",                Connection_set_attr,        METH_VARARGS, set_attr_doc   },
     { "__enter__",               Connection_enter,           METH_NOARGS,  enter_doc      },
     { "__exit__",                Connection_exit,            METH_VARARGS, exit_doc       },
+    { "bcp_init",                (PyCFunction)Connection_bcp_init,      METH_VARARGS|METH_KEYWORDS, bcp_init_doc },
+    { "bcp_bind_columns",        (PyCFunction)Connection_bcp_bind_columns, METH_VARARGS|METH_KEYWORDS, bcp_bind_columns_doc },
+    { "bcp_setrow",              Connection_bcp_setrow,                 METH_VARARGS, bcp_setrow_doc    },
+    { "bcp_sendrow",             Connection_bcp_sendrow,                METH_NOARGS,  bcp_sendrow_doc   },
+    { "bcp_batch",               Connection_bcp_batch,                  METH_VARARGS, bcp_batch_doc     },
+    { "bcp_done",                Connection_bcp_done,                   METH_NOARGS,  bcp_done_doc      },
+
 
     { 0, 0, 0, 0 }
 };
@@ -1565,10 +2264,20 @@ static PyGetSetDef Connection_getseters[] = {
     { "maxwrite", Connection_getmaxwrite, Connection_setmaxwrite, "The maximum bytes to write before using SQLPutData.", 0 },
     { "readvar_initsize", Connection_getreadvarinitsize, Connection_setreadvarinitsize,
       "The initial buffer size in bytes for reading values from variable-length columns.", 0 },
+    { "decimal_mode", Connection_getdecimalmode, Connection_setdecimalmode,
+      "How DECIMAL and NUMERIC values are read:\n\n"
+      "'binary': into a SQL_NUMERIC_STRUCT, which is not affected by the locale.  This is the\n"
+      "  default except for PostgreSQL.  The struct cannot hold NaN or Infinity, or more than\n"
+      "  38 digits.\n"
+      "'text': as text with no grouping separators: a sign, digits, and at most one decimal\n"
+      "  point, which can be '.' or ','; or NaN, Infinity, or -Infinity.  Other text raises\n"
+      "  DataError.  This is the default for PostgreSQL.\n"
+      "'locale': as text, after removing everything but digits, '-', and the separator from\n"
+      "  setDecimalSeparator, which then becomes the decimal point.  For drivers that add\n"
+      "  grouping separators or currency symbols.", 0 },
     { "fetch_decimal_as_string", Connection_getfetchdecimalasstring, Connection_setfetchdecimalasstring,
-      "If True, DECIMAL and NUMERIC values are fetched as strings using the legacy\n"
-      "locale-aware path.  If False (the default), values are fetched using a binary\n"
-      "representation that is not affected by the locale.", 0 },
+      "Deprecated; use decimal_mode.  True means decimal_mode is not 'binary'.  Setting True\n"
+      "selects 'locale' and False selects 'binary'.", 0 },
     { "compat_diagrec_byte_length", Connection_getcompat_diagrec_byte_length, Connection_setcompat_diagrec_byte_length,
       "If True, the driver reports byte length instead of character length in SQLGetDiagRecW().", 0 },
     { 0 }

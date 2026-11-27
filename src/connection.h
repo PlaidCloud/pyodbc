@@ -12,11 +12,28 @@
 #ifndef CONNECTION_H
 #define CONNECTION_H
 
+struct BcpState;
+
 struct Cursor;
 
 extern PyTypeObject ConnectionType;
 
 struct TextEnc;
+
+// Connection.decimal_mode: how DECIMAL and NUMERIC columns are read.
+enum
+{
+    // Into a SQL_NUMERIC_STRUCT, falling back to text for drivers that can't.
+    DECIMAL_MODE_BINARY,
+
+    // As text with no grouping separators: a sign, digits, and at most one decimal point,
+    // which can be '.' or ',', or NaN or [-]Infinity.  Anything else raises.
+    DECIMAL_MODE_TEXT,
+
+    // As text cleaned with the decimal separator from setDecimalSeparator, the behavior from
+    // before 5.4.  Grouping separators and currency symbols are removed.
+    DECIMAL_MODE_LOCALE,
+};
 
 struct Connection
 {
@@ -32,6 +49,9 @@ struct Connection
     char odbc_major;
     char odbc_minor;
 
+    // SQL Server bulk copy (BCP) state, allocated the first time BCP is used (see bcp_support.h).
+    BcpState* bcp;
+
     // The escape character from SQLGetInfo.  This is not initialized until requested, so this may be zero!
     PyObject* searchescape;
 
@@ -39,8 +59,8 @@ struct Connection
     // to insert NULLs into binary columns.
     bool supports_describeparam;
 
-    // Set to true if the driver doesn't handle SQL_NUMERIC_STRUCT properly.
-    bool fetch_decimal_as_string;
+    // How DECIMAL and NUMERIC columns are read: one of the DECIMAL_MODE_ values.
+    int decimal_mode;
 
     // The column size of datetime columns, obtained from SQLGetInfo(), used to determine the datetime precision.
     int datetime_precision;

@@ -71,6 +71,21 @@ struct ParamInfo
     // written to each SQLPutData call.  (It is not clear if they are limited
     // like SQLBindParameter or not.)
 
+    // fast_executemany only: true if the driver cannot describe this parameter (and
+    // setinputsizes did not give a scale), so a Decimal's precision and scale are taken from
+    // the values.  The batch is executed and rebound when a row does not fit the scale chosen
+    // so far.
+    bool guessScale;
+    // When guessScale is set: the type, size, and scale from SQLDescribeParam and
+    // setinputsizes, restored before each batch is bound so that guessing for a Decimal does
+    // not change how other types in the column are bound; the most digits to bind (38, or the
+    // setinputsizes size); and the scale guessed for the last batch, or -1.
+    SQLSMALLINT describedType;
+    SQLULEN     describedSize;
+    SQLSMALLINT describedDigits;
+    SQLSMALLINT guessPrecision;
+    SQLSMALLINT guessedScale;
+
     // For TVPs, the nested descriptors and current row.
     struct ParamInfo *nested;
     SQLLEN curTvpRow;
@@ -97,6 +112,16 @@ struct Cursor
 
     // Set to SQL_NULL_HANDLE when the cursor is closed.
     HSTMT hstmt;
+
+    // If true, fast executemany loads INSERTs with the SQL Server bulk copy API when it can.
+    bool use_bcp_fast = false;
+
+    // Rows per BCP batch; 0 sends all rows as one batch.
+    long bcp_batch_rows = 0;
+
+    // If true, the BCP fast path passes the TABLOCK hint, which enables a bulk-update
+    // lock and (with a SIMPLE/BULK_LOGGED recovery model + heap) minimal logging.
+    bool bcp_tablock = false;
 
     //
     // SQL Parameters
@@ -150,7 +175,7 @@ struct Cursor
     // The Cursor.rowcount attribute from the DB API specification.
     int rowcount;
 
-    // A dictionary that maps from column name (PyString) to index into the result columns (PyInteger).  This is
+    // A dictionary that maps from column name (str) to index into the result columns (int).  This is
     // constructed during an execute and shared with each row (reference counted) to implement accessing results by
     // column name.
     //
